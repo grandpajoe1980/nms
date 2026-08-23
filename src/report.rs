@@ -543,6 +543,7 @@ body.noside #side { display:none; }
   <span style="color:var(--dim)" id="viscount"></span>
   <span style="flex:1"></span>
   <span class="pill" id="jobpill">idle</span>
+  <a href="/console"><button title="dashboards, events, reports, settings">Console</button></a>
   <button id="btn-start" title="discover the network, then start continuous monitoring">Start NMS</button>
   <a id="lnk-routes" href="/api/routes" target="_blank"><button>Routes</button></a>
   <a id="lnk-ifaces" href="/api/ifaces" target="_blank"><button>Ifaces</button></a>
