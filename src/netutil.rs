@@ -22,7 +22,11 @@ pub fn bits(n: Ipv4Net) -> u32 {
 }
 
 pub fn broadcast(n: Ipv4Net) -> u32 {
-    bits(n) | (u32::MAX >> n.prefix_len())
+    match n.prefix_len() {
+        0 => u32::MAX,
+        32 => bits(n),
+        p => bits(n) | (u32::MAX >> p),
+    }
 }
 
 pub fn host_count(n: Ipv4Net) -> u64 {

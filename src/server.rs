@@ -1,8 +1,8 @@
 use crate::check::{self, Transition};
+use crate::db;
 use crate::discover;
 use crate::engine::ScanParams;
 use crate::model::{Model, State};
-use crate::monitor;
 use crate::report;
 use anyhow::Result;
 use ipnet::Ipv4Net;
@@ -48,6 +48,8 @@ struct Shared {
     engine_lock: Mutex<()>,
     revision: AtomicU64,
     events: Mutex<VecDeque<Event>>,
+    store: Arc<crate::db::Db>,
+    last_stats: Mutex<Option<crate::ops::CycleStats>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -63,6 +65,7 @@ struct Event {
 pub fn run(p: Params) -> Result<()> {
     let addr = format!("127.0.0.1:{}", p.port);
     let listener = TcpListener::bind(&addr)?;
+    let store = Arc::new(crate::db::Db::open(&p.out_dir.join("ops.db"))?);
     let shared = Arc::new(Shared {
         job: Mutex::new(Job::Idle),
         message: Mutex::new("ready".into()),
@@ -70,6 +73,8 @@ pub fn run(p: Params) -> Result<()> {
         engine_lock: Mutex::new(()),
         revision: AtomicU64::new(0),
         events: Mutex::new(VecDeque::new()),
+        last_stats: Mutex::new(None),
+        store,
     });
     let url = format!("http://{addr}");
     println!("[*] NMS control panel: {url}");
@@ -134,6 +139,7 @@ fn route(method: &str, path: &str, query: &str, shared: &Arc<Shared>, p: &Params
         },
         ("GET", "/api/status") => {
             let job = *shared.job.lock().unwrap();
+            let stats = shared.last_stats.lock().unwrap().clone();
             json(
                 "200 OK",
                 serde_json::json!({
@@ -142,6 +148,7 @@ fn route(method: &str, path: &str, query: &str, shared: &Arc<Shared>, p: &Params
                     "message": shared.message.lock().unwrap().clone(),
                     "revision": shared.revision.load(Ordering::Relaxed),
                     "events": shared.events.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
+                    "ops": stats,
                 }),
             )
         }
@@ -215,17 +222,43 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
             scan: ScanParams { rate_pps: 600.0, concurrency: 512, timeout_ms: 800, payload_len: 32 },
             out_dir: p.out_dir.clone(),
         })
-        .map(|m| format!("discovery complete: {} devices, {} subnets", m.devices.len(), m.subnets.len())),
-        Job::Check => check::sweep_once(&check_params(&p)).map(|result| {
-            for transition in &result.transitions {
-                if transition.from == Some(State::Up) && transition.to == State::Down {
-                    monitor::record_down_alert(transition, &p.out_dir);
-                }
-                push_transition(&shared, transition);
+        .map(|m| {
+            if let Ok(ids) = crate::ops::sync_model(
+                &shared.store.lock(),
+                &m,
+                db::get_setting_or(&shared.store.lock(), "site_auto_prefix", "24")
+                    .parse()
+                    .unwrap_or(24),
+            ) {
+                format!(
+                    "discovery complete: {} devices, {} subnets (inventory synced: {})",
+                    m.devices.len(),
+                    m.subnets.len(),
+                    ids.len()
+                )
+            } else {
+                format!("discovery complete: {} devices, {} subnets", m.devices.len(), m.subnets.len())
             }
-            let (up, down, _, _) = result.model.counts();
-            format!("check complete: {up} known up, {down} known down")
         }),
+        Job::Check => match crate::ops::run_cycle(&check_params(&p), &shared.store) {
+            Ok((result, stats)) => {
+                for transition in &result.transitions {
+                    push_transition(&shared, transition);
+                }
+                *shared.last_stats.lock().unwrap() = Some(stats.clone());
+                Ok(format!(
+                    "check complete: up={up} down_root={down} unreachable={unreach} \
+                         degraded={deg} events=+{ev} queued={q}",
+                    up = stats.up,
+                    down = stats.down_root,
+                    unreach = stats.unreachable,
+                    deg = stats.degraded,
+                    ev = stats.new_events,
+                    q = stats.queued
+                ))
+            }
+            Err(e) => Err(e),
+        },
         Job::Idle => unreachable!(),
     };
     let changed = result.is_ok();
@@ -269,24 +302,23 @@ fn monitor_loop(shared: Arc<Shared>, p: Params) {
             if !shared.monitoring.load(Ordering::Relaxed) {
                 break;
             }
-            match check::sweep_once(&check_params(&p)) {
-                Ok(result) => {
-                    let alerts: Vec<&Transition> = result
-                        .transitions
-                        .iter()
-                        .filter(|t| t.from == Some(State::Up) && t.to == State::Down)
-                        .collect();
-                    for transition in &alerts {
-                        monitor::record_down_alert(transition, &p.out_dir);
-                    }
+            match crate::ops::run_cycle(&check_params(&p), &shared.store) {
+                Ok((result, stats)) => {
                     for transition in &result.transitions {
                         push_transition(&shared, transition);
                     }
+                    *shared.last_stats.lock().unwrap() = Some(stats.clone());
                     shared.revision.fetch_add(1, Ordering::Relaxed);
-                    let (up, down, _, _) = result.model.counts();
                     let message = format!(
-                        "monitor: {up} known up, {down} known down, {} new alert(s)",
-                        alerts.len()
+                        "monitor: up={up} down_root={down} unreachable={unreach} \
+                             degraded={deg} | events=+{ev} queued={q} | cycle {} ms",
+                        stats.duration_ms,
+                        up = stats.up,
+                        down = stats.down_root,
+                        unreach = stats.unreachable,
+                        deg = stats.degraded,
+                        ev = stats.new_events,
+                        q = stats.queued
                     );
                     println!("[server] {message}");
                     set_message(&shared, &message);

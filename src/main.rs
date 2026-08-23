@@ -6,6 +6,7 @@ mod engine;
 mod model;
 mod monitor;
 mod netutil;
+mod ops;
 mod oui;
 mod ping;
 mod report;
@@ -17,6 +18,7 @@ use clap::{Parser, Subcommand};
 use ipnet::Ipv4Net;
 use model::{Model, Role, State};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -205,8 +207,19 @@ fn main() -> Result<()> {
                     timeout_ms,
                     payload_len: 32,
                 },
-                out_dir: out,
+                out_dir: out.clone(),
             })?;
+            let store = db::Db::open(&out.join("ops.db"))?;
+            {
+                let c = store.lock();
+                let prefix: u8 = db::get_setting_or(&c, "site_auto_prefix", "24")
+                    .parse()
+                    .unwrap_or(24);
+                match ops::sync_model(&c, &m, prefix) {
+                    Ok(ids) => println!("[*] inventory synced: {} device(s)", ids.len()),
+                    Err(e) => eprintln!("[!] inventory sync failed: {e}"),
+                }
+            }
             print_summary(&m);
         }
         Cmd::Check {
@@ -219,7 +232,7 @@ fn main() -> Result<()> {
             confirm_down,
             out,
         } => {
-            let m = check::run(check::Params {
+            let params = check::Params {
                 extra_subnets: parse_subnets(subnets)?,
                 scan: engine::ScanParams {
                     rate_pps: rate,
@@ -227,12 +240,25 @@ fn main() -> Result<()> {
                     timeout_ms,
                     payload_len: 32,
                 },
-                out_dir: out,
+                out_dir: out.clone(),
                 max_targets,
                 budget_secs,
                 confirm_down,
-            })?;
-            print_summary(&m);
+            };
+            let store = Arc::new(db::Db::open(&out.join("ops.db"))?);
+            let (res, stats) = ops::run_cycle(&params, &store)?;
+            println!(
+                "[ops] up={up} down_root={down} unreachable={unreach} degraded={deg} \
+                     events=+{ev} queued={q} in {ms} ms",
+                up = stats.up,
+                down = stats.down_root,
+                unreach = stats.unreachable,
+                deg = stats.degraded,
+                ev = stats.new_events,
+                q = stats.queued,
+                ms = stats.duration_ms
+            );
+            print_summary(&res.model);
         }
         Cmd::Monitor { interval_secs, exec, subnets, rate, concurrency, timeout_ms, max_targets, budget_secs, confirm_down, out } => {
             monitor::run(monitor::Params {

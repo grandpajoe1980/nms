@@ -325,7 +325,7 @@ pub fn site_name(conn: &Connection, site_id: Option<i64>) -> String {
 pub fn auto_site_label(ip: &str, prefix: u8) -> Option<String> {
     let addr: std::net::Ipv4Addr = ip.parse().ok()?;
     let octets = addr.octets();
-    let keep = (((prefix as usize).max(8)).min(32) + 7) / 8;
+    let keep = (prefix as usize).clamp(8, 32).div_ceil(8);
     let parts: Vec<String> =
         octets.iter().take(keep).map(|b| b.to_string()).collect();
     Some(format!("{}/{}", parts.join("."), prefix))
@@ -365,21 +365,21 @@ const DEVICE_COLS: &str = "id, ip, mac, name, role, site_id, site_source, parent
 pub fn device_by_ip(conn: &Connection, ip: &str) -> Result<Option<DeviceRec>> {
     let sql = format!("SELECT {DEVICE_COLS} FROM devices WHERE ip = ?1");
     Ok(conn
-        .query_row(&sql, params![ip], |r| row_device(r))
+        .query_row(&sql, params![ip], row_device)
         .optional()?)
 }
 
 pub fn device_by_id(conn: &Connection, id: i64) -> Result<Option<DeviceRec>> {
     let sql = format!("SELECT {DEVICE_COLS} FROM devices WHERE id = ?1");
     Ok(conn
-        .query_row(&sql, params![id], |r| row_device(r))
+        .query_row(&sql, params![id], row_device)
         .optional()?)
 }
 
 pub fn all_devices(conn: &Connection) -> Result<Vec<DeviceRec>> {
     let sql = format!("SELECT {DEVICE_COLS} FROM devices ORDER BY ip");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| row_device(r))?;
+    let rows = stmt.query_map([], row_device)?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
@@ -423,13 +423,6 @@ pub fn upsert_device(conn: &Connection, u: &DeviceUpdate) -> Result<DeviceRec> {
     };
     let mac = u.mac.clone().or_else(|| existing.as_ref().and_then(|d| d.mac.clone()));
     let ever_up = existing.as_ref().is_some_and(|d| d.ever_up) || u.up_now;
-    let down_since = existing.as_ref().and_then(|d| d.down_since_ts).or_else(|| {
-        if u.state == "down" || u.state == "unreachable" {
-            Some(u.ts)
-        } else {
-            None
-        }
-    });
     let (first, last) = match &existing {
         Some(d) => (d.first_seen_ts, u.ts),
         None => (u.ts, u.ts),
@@ -522,15 +515,13 @@ pub fn insert_samples(conn: &Connection, batch: &[Sample]) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut stmt = tx.prepare("INSERT OR REPLACE INTO samples(device_id, ts, up, rtt_ms)
-                                   VALUES (?1, ?2, ?3, ?4)")?;
-        for s in batch {
-            stmt.execute(params![s.device_id, s.ts_millis, s.up as i64, s.rtt_ms])?;
-        }
+    // NOTE: runs inside the caller's transaction when called from ops; the
+    // prepared statement batches all rows on one connection either way.
+    let mut stmt = conn.prepare("INSERT OR REPLACE INTO samples(device_id, ts, up, rtt_ms)
+                                 VALUES (?1, ?2, ?3, ?4)")?;
+    for s in batch {
+        stmt.execute(params![s.device_id, s.ts_millis, s.up as i64, s.rtt_ms])?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -716,9 +707,7 @@ pub fn open_event_for(conn: &Connection, device_id: i64, kind: &str) -> Result<O
          WHERE device_id = ?1 AND kind = ?2 AND state = 'open'
          ORDER BY created_ts DESC LIMIT 1"
     );
-    Ok(conn
-        .query_row(&sql, params![device_id, kind], |r| row_event(r))
-        .optional()?)
+    Ok(conn.query_row(&sql, params![device_id, kind], row_event).optional()?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -799,6 +788,11 @@ pub fn ack_event(conn: &Connection, id: i64, ack: bool, by: &str, ts: i64) -> Re
     Ok(1)
 }
 
+pub fn event_by_id(conn: &Connection, id: i64) -> Result<Option<EventRec>> {
+    let sql = format!("SELECT {EVENT_COLS} FROM events WHERE id = ?1");
+    Ok(conn.query_row(&sql, params![id], row_event).optional()?)
+}
+
 pub fn list_events(
     conn: &Connection,
     only_open: bool,
@@ -826,7 +820,7 @@ pub fn list_events(
     args.push(Value::Integer(offset));
     sql.push_str(&format!(" OFFSET ?{}", args.len()));
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| row_event(r))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), row_event)?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
@@ -974,7 +968,7 @@ mod tests {
     #[test]
     fn device_upsert_preserves_manual_site() {
         let db = setup();
-        let mut c = db.lock();
+        let c = db.lock();
         let u = DeviceUpdate {
             ip: "10.0.0.5",
             mac: None,

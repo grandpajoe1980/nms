@@ -40,9 +40,6 @@ pub struct RunResult {
     pub model: Model,
     pub transitions: Vec<Transition>,
     pub probes: Vec<Probe>,
-    pub up: usize,
-    pub down: usize,
-    pub probed: usize,
     pub unprobed: usize,
 }
 
@@ -140,16 +137,9 @@ pub fn sweep_once(p: &Params) -> Result<RunResult> {
     let now_str = Utc::now().to_rfc3339();
     let mut new_devices: Vec<Device> = Vec::new();
     let mut transitions: Vec<Transition> = Vec::new();
-    let mut up_c = 0usize;
-    let mut down_c = 0usize;
     for o in &outcomes {
         if !o.probed {
             continue;
-        }
-        if o.up {
-            up_c += 1;
-        } else {
-            down_c += 1;
         }
         match idx.get(&o.ip) {
             Some(&i) => {
@@ -235,34 +225,6 @@ pub fn sweep_once(p: &Params) -> Result<RunResult> {
     let html = report::render(&model, 3500)?;
     std::fs::write(p.out_dir.join("map.html"), html)?;
 
-    Ok(RunResult { model, transitions, probes, up: up_c, down: down_c, probed: up_c + down_c, unprobed })
+    Ok(RunResult { model, transitions, probes, unprobed })
 }
 
-pub fn run(p: Params) -> Result<Model> {
-    println!(
-        "[*] loading model from {}",
-        p.out_dir.join("model.json").display()
-    );
-    match Model::load(&p.out_dir.join("model.json")) {
-        Ok(m) => println!("[*] loaded model: {} device(s), {} subnet(s)", m.devices.len(), m.subnets.len()),
-        Err(_) => println!("[*] no existing model; building one from provided subnets/routes"),
-    }
-
-    let t0 = Instant::now();
-    let res = sweep_once(&p)?;
-    println!(
-        "[*] checked {} address(es) | rate<={:.0}pps workers={} timeout={}ms deadline={}s",
-        res.probed + res.unprobed,
-        p.scan.rate_pps,
-        p.scan.concurrency,
-        p.scan.timeout_ms,
-        p.budget_secs
-    );
-    if res.unprobed > 0 {
-        println!("[!] {} address(es) unprobed (deadline hit); their state was preserved", res.unprobed);
-    }
-    println!("[+] up={} down={} in {:.1}s", res.up, res.down, t0.elapsed().as_secs_f64());
-    println!("[*] wrote {}", p.out_dir.join("model.json").display());
-    println!("[*] wrote {}", p.out_dir.join("map.html").display());
-    Ok(res.model)
-}
