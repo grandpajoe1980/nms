@@ -1,0 +1,1124 @@
+// Temporary until all consumers land (removed during integration).
+#![allow(dead_code)]
+
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
+
+pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
+    ("poll_interval_secs", "60"),
+    ("rtt_warn_ms", "150"),
+    ("rtt_crit_ms", "400"),
+    ("loss_window", "6"),
+    ("loss_warn_pct", "33"),
+    ("flap_window_mins", "30"),
+    ("flap_threshold", "5"),
+    ("raw_retention_hours", "36"),
+    ("hourly_retention_days", "14"),
+    ("daily_retention_days", "400"),
+    ("webhook_url", ""),
+    ("webhook_enabled", "0"),
+    ("site_auto_prefix", "24"),
+];
+
+pub struct Db {
+    conn: Mutex<Connection>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceRec {
+    pub id: i64,
+    pub ip: String,
+    pub mac: Option<String>,
+    pub name: Option<String>,
+    pub role: String,
+    pub site_id: Option<i64>,
+    pub site_source: String,
+    pub parent_id: Option<i64>,
+    pub managed: bool,
+    pub poll_secs: Option<i64>,
+    pub first_seen_ts: i64,
+    pub last_seen_ts: i64,
+    pub ever_up: bool,
+    pub state: String,
+    pub eff_state: String,
+    pub perf_status: String,
+    pub down_since_ts: Option<i64>,
+    pub maintenance_until_ts: Option<i64>,
+    pub flap_count: i64,
+    pub notes: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Sample {
+    pub device_id: i64,
+    pub ts_millis: i64,
+    pub up: bool,
+    pub rtt_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Segment {
+    pub id: i64,
+    pub device_id: i64,
+    pub state: String,
+    pub started_ts: i64,
+    pub ended_ts: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EventRec {
+    pub id: i64,
+    pub created_ts: i64,
+    pub updated_ts: Option<i64>,
+    pub device_id: Option<i64>,
+    pub ip: Option<String>,
+    pub kind: String,
+    pub severity: String,
+    pub state: String,
+    pub message: String,
+    pub details: Option<String>,
+    pub acknowledged: bool,
+    pub ack_by: Option<String>,
+    pub ack_ts: Option<i64>,
+    pub cleared_ts: Option<i64>,
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn now_millis() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("open sqlite {}", path.display()))?;
+        Self::init(conn)
+    }
+
+    pub fn open_memory() -> Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> Result<Self> {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.execute_batch(SCHEMA)?;
+        for (k, v) in DEFAULT_SETTINGS {
+            conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES (?1, ?2)",
+                params![k, v],
+            )?;
+        }
+        Ok(Db { conn: Mutex::new(conn) })
+    }
+
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS meta(
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sites(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE,
+  region     TEXT,
+  created_ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS devices(
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip                   TEXT NOT NULL UNIQUE,
+  mac                  TEXT,
+  name                 TEXT,
+  role                 TEXT NOT NULL,
+  site_id              INTEGER REFERENCES sites(id),
+  site_source          TEXT NOT NULL DEFAULT 'auto',
+  parent_id            INTEGER REFERENCES devices(id),
+  managed              INTEGER NOT NULL DEFAULT 1,
+  poll_secs            INTEGER,
+  first_seen_ts        INTEGER NOT NULL,
+  last_seen_ts         INTEGER NOT NULL,
+  ever_up              INTEGER NOT NULL DEFAULT 0,
+  state                TEXT NOT NULL DEFAULT 'unknown',
+  eff_state            TEXT NOT NULL DEFAULT 'unknown',
+  perf_status          TEXT NOT NULL DEFAULT 'ok',
+  down_since_ts        INTEGER,
+  maintenance_until_ts INTEGER,
+  flap_count           INTEGER NOT NULL DEFAULT 0,
+  notes                TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_devices_site ON devices(site_id);
+CREATE INDEX IF NOT EXISTS idx_devices_parent ON devices(parent_id);
+CREATE INDEX IF NOT EXISTS idx_devices_eff ON devices(eff_state);
+CREATE TABLE IF NOT EXISTS samples(
+  device_id INTEGER NOT NULL,
+  ts        INTEGER NOT NULL,
+  up        INTEGER NOT NULL,
+  rtt_ms    REAL,
+  PRIMARY KEY (device_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
+CREATE TABLE IF NOT EXISTS rollup_hourly(
+  device_id   INTEGER NOT NULL,
+  hour        INTEGER NOT NULL,
+  probes      INTEGER NOT NULL,
+  ups         INTEGER NOT NULL,
+  rtt_sum     REAL NOT NULL DEFAULT 0,
+  rtt_min     REAL,
+  rtt_max     REAL,
+  jitter_sum  REAL NOT NULL DEFAULT 0,
+  jitter_n    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (device_id, hour)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_rollup_hourly_hour ON rollup_hourly(hour);
+CREATE TABLE IF NOT EXISTS rollup_daily(
+  device_id  INTEGER NOT NULL,
+  day        INTEGER NOT NULL,
+  probes     INTEGER NOT NULL,
+  ups        INTEGER NOT NULL,
+  rtt_sum    REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (device_id, day)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_rollup_daily_day ON rollup_daily(day);
+CREATE TABLE IF NOT EXISTS segments(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id  INTEGER NOT NULL,
+  state      TEXT NOT NULL,
+  started_ts INTEGER NOT NULL,
+  ended_ts   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_segments_dev ON segments(device_id, started_ts);
+CREATE INDEX IF NOT EXISTS idx_segments_open ON segments(state) WHERE ended_ts IS NULL;
+CREATE TABLE IF NOT EXISTS events(
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_ts   INTEGER NOT NULL,
+  updated_ts   INTEGER,
+  device_id    INTEGER,
+  ip           TEXT,
+  kind         TEXT NOT NULL,
+  severity     TEXT NOT NULL,
+  state        TEXT NOT NULL DEFAULT 'open',
+  message      TEXT NOT NULL,
+  details      TEXT,
+  acknowledged INTEGER NOT NULL DEFAULT 0,
+  ack_by       TEXT,
+  ack_ts       INTEGER,
+  cleared_ts   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_open ON events(state, severity, created_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id, kind, state);
+CREATE TABLE IF NOT EXISTS audit_log(
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      INTEGER NOT NULL,
+  actor   TEXT NOT NULL,
+  action  TEXT NOT NULL,
+  target  TEXT,
+  details TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
+CREATE TABLE IF NOT EXISTS outbound(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_ts INTEGER NOT NULL,
+  sent_ts    INTEGER,
+  status     TEXT NOT NULL DEFAULT 'pending',
+  tries      INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  event_id   INTEGER,
+  payload    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound(status, created_ts);
+"#;
+
+// ---------------------------------------------------------------- settings
+
+pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        params![key],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+pub fn get_setting_or(conn: &Connection, key: &str, default: &str) -> String {
+    get_setting(conn, key).unwrap_or_else(|| default.to_string())
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+pub fn all_settings(conn: &Connection) -> HashMap<String, String> {
+    let mut stmt = match conn.prepare("SELECT key, value FROM meta") {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .ok();
+    let mut out = HashMap::new();
+    if let Some(rows) = rows {
+        for row in rows.flatten() {
+            out.insert(row.0, row.1);
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------------- audit
+
+pub fn audit(conn: &Connection, actor: &str, action: &str, target: &str, details: &str) {
+    let _ = conn.execute(
+        "INSERT INTO audit_log(ts, actor, action, target, details) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![now(), actor, action, target, details],
+    );
+}
+
+// ------------------------------------------------------------------- sites
+
+pub fn ensure_site(conn: &Connection, name: &str) -> Result<i64> {
+    let existing: Option<i64> = conn
+        .query_row("SELECT id FROM sites WHERE name = ?1", params![name], |r| r.get(0))
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO sites(name, created_ts) VALUES (?1, ?2)",
+        params![name, now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn site_name(conn: &Connection, site_id: Option<i64>) -> String {
+    let Some(id) = site_id else { return "-".into() };
+    conn.query_row("SELECT name FROM sites WHERE id = ?1", params![id], |r| {
+        r.get::<_, String>(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "-".into())
+}
+
+/// Auto-site label from an IPv4 address using the configured prefix length.
+pub fn auto_site_label(ip: &str, prefix: u8) -> Option<String> {
+    let addr: std::net::Ipv4Addr = ip.parse().ok()?;
+    let octets = addr.octets();
+    let keep = (((prefix as usize).max(8)).min(32) + 7) / 8;
+    let parts: Vec<String> =
+        octets.iter().take(keep).map(|b| b.to_string()).collect();
+    Some(format!("{}/{}", parts.join("."), prefix))
+}
+
+// ----------------------------------------------------------------- devices
+
+fn row_device(r: &Row) -> rusqlite::Result<DeviceRec> {
+    Ok(DeviceRec {
+        id: r.get(0)?,
+        ip: r.get(1)?,
+        mac: r.get(2)?,
+        name: r.get(3)?,
+        role: r.get(4)?,
+        site_id: r.get(5)?,
+        site_source: r.get(6)?,
+        parent_id: r.get(7)?,
+        managed: r.get::<_, i64>(8)? != 0,
+        poll_secs: r.get(9)?,
+        first_seen_ts: r.get(10)?,
+        last_seen_ts: r.get(11)?,
+        ever_up: r.get::<_, i64>(12)? != 0,
+        state: r.get(13)?,
+        eff_state: r.get(14)?,
+        perf_status: r.get(15)?,
+        down_since_ts: r.get(16)?,
+        maintenance_until_ts: r.get(17)?,
+        flap_count: r.get(18)?,
+        notes: r.get(19)?,
+    })
+}
+
+const DEVICE_COLS: &str = "id, ip, mac, name, role, site_id, site_source, parent_id, managed, \
+     poll_secs, first_seen_ts, last_seen_ts, ever_up, state, eff_state, perf_status, \
+     down_since_ts, maintenance_until_ts, flap_count, notes";
+
+pub fn device_by_ip(conn: &Connection, ip: &str) -> Result<Option<DeviceRec>> {
+    let sql = format!("SELECT {DEVICE_COLS} FROM devices WHERE ip = ?1");
+    Ok(conn
+        .query_row(&sql, params![ip], |r| row_device(r))
+        .optional()?)
+}
+
+pub fn device_by_id(conn: &Connection, id: i64) -> Result<Option<DeviceRec>> {
+    let sql = format!("SELECT {DEVICE_COLS} FROM devices WHERE id = ?1");
+    Ok(conn
+        .query_row(&sql, params![id], |r| row_device(r))
+        .optional()?)
+}
+
+pub fn all_devices(conn: &Connection) -> Result<Vec<DeviceRec>> {
+    let sql = format!("SELECT {DEVICE_COLS} FROM devices ORDER BY ip");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| row_device(r))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub struct DeviceUpdate<'a> {
+    pub ip: &'a str,
+    pub mac: Option<String>,
+    pub role: &'a str,
+    pub subnet_site_label: Option<String>,
+    pub parent_ip: Option<&'a str>,
+    pub state: &'a str,
+    pub up_now: bool,
+    pub rtt_ms: Option<f64>,
+    pub ts: i64,
+    pub site_prefix: u8,
+}
+
+/// Upsert by IP. Manual site assignment (`site_source='manual'`) and the
+/// maintenance window are never overwritten by automatic sync.
+pub fn upsert_device(conn: &Connection, u: &DeviceUpdate) -> Result<DeviceRec> {
+    let existing = device_by_ip(conn, u.ip)?;
+    let site_id = match existing.as_ref().and_then(|d| d.site_id) {
+        Some(id) if existing.as_ref().is_some_and(|d| d.site_source == "manual") => Some(id),
+        _ => match &u.subnet_site_label {
+            Some(label) => Some(ensure_site(conn, label)?),
+            None => None,
+        },
+    };
+    let site_source = if existing.as_ref().is_some_and(|d| d.site_source == "manual") {
+        "manual".to_string()
+    } else if u.subnet_site_label.is_some() {
+        "auto".to_string()
+    } else {
+        existing
+            .as_ref()
+            .map(|d| d.site_source.clone())
+            .unwrap_or_else(|| "auto".into())
+    };
+    let parent_id = match u.parent_ip {
+        Some(pip) => device_by_ip(conn, pip)?.map(|p| p.id),
+        None => None,
+    };
+    let mac = u.mac.clone().or_else(|| existing.as_ref().and_then(|d| d.mac.clone()));
+    let ever_up = existing.as_ref().is_some_and(|d| d.ever_up) || u.up_now;
+    let down_since = existing.as_ref().and_then(|d| d.down_since_ts).or_else(|| {
+        if u.state == "down" || u.state == "unreachable" {
+            Some(u.ts)
+        } else {
+            None
+        }
+    });
+    let (first, last) = match &existing {
+        Some(d) => (d.first_seen_ts, u.ts),
+        None => (u.ts, u.ts),
+    };
+    conn.execute(
+        "INSERT INTO devices(ip, mac, role, site_id, site_source, parent_id, first_seen_ts,
+             last_seen_ts, ever_up, state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(ip) DO UPDATE SET
+             mac = excluded.mac,
+             role = excluded.role,
+             site_id = COALESCE(CASE WHEN devices.site_source = 'manual'
+                                     THEN devices.site_id END, excluded.site_id),
+             site_source = excluded.site_source,
+             parent_id = excluded.parent_id,
+             last_seen_ts = excluded.last_seen_ts,
+             ever_up = MAX(devices.ever_up, excluded.ever_up),
+             state = excluded.state",
+        params![
+            u.ip,
+            mac,
+            u.role,
+            site_id,
+            site_source,
+            parent_id,
+            first,
+            last,
+            ever_up as i64,
+            u.state
+        ],
+    )?;
+    let rec = device_by_ip(conn, u.ip)?.context("device vanished after upsert")?;
+    Ok(rec)
+}
+
+pub fn set_device_fields(
+    conn: &Connection,
+    id: i64,
+    eff_state: &str,
+    perf_status: &str,
+    down_since_ts: Option<i64>,
+    flap_count: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE devices SET eff_state = ?2, perf_status = ?3, down_since_ts = ?4,
+             flap_count = ?5 WHERE id = ?1",
+        params![id, eff_state, perf_status, down_since_ts, flap_count],
+    )?;
+    Ok(())
+}
+
+pub fn assign_site(conn: &Connection, id: i64, site_name_opt: Option<&str>) -> Result<()> {
+    match site_name_opt {
+        Some(name) => {
+            let sid = ensure_site(conn, name)?;
+            conn.execute(
+                "UPDATE devices SET site_id = ?2, site_source = 'manual' WHERE id = ?1",
+                params![id, sid],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "UPDATE devices SET site_id = NULL, site_source = 'auto' WHERE id = ?1",
+                params![id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn set_maintenance(conn: &Connection, id: i64, until_ts: Option<i64>) -> Result<()> {
+    conn.execute(
+        "UPDATE devices SET maintenance_until_ts = ?2 WHERE id = ?1",
+        params![id, until_ts],
+    )?;
+    Ok(())
+}
+
+pub fn set_managed(conn: &Connection, id: i64, managed: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE devices SET managed = ?2 WHERE id = ?1",
+        params![id, managed as i64],
+    )?;
+    Ok(())
+}
+
+// ----------------------------------------------------------------- samples
+
+pub fn insert_samples(conn: &Connection, batch: &[Sample]) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare("INSERT OR REPLACE INTO samples(device_id, ts, up, rtt_ms)
+                                   VALUES (?1, ?2, ?3, ?4)")?;
+        for s in batch {
+            stmt.execute(params![s.device_id, s.ts_millis, s.up as i64, s.rtt_ms])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Recompute one device-hour rollup from raw samples, including jitter
+/// (mean absolute delta between consecutive RTTs).
+pub fn recompute_hourly_rollup(conn: &Connection, device_id: i64, hour_start_secs: i64) -> Result<()> {
+    let lo = hour_start_secs * 1000;
+    let hi = lo + 3_600_000;
+    let mut stmt = conn.prepare(
+        "SELECT ts, up, rtt_ms FROM samples
+         WHERE device_id = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts",
+    )?;
+    let rows: Vec<(i64, bool, Option<f64>)> = stmt
+        .query_map(params![device_id, lo, hi], |r| {
+            Ok((r.get(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let probes = rows.len() as i64;
+    let ups = rows.iter().filter(|(_, up, _)| *up).count() as i64;
+    let rtts: Vec<f64> = rows.iter().filter_map(|(_, _, r)| *r).collect();
+    let rtt_sum: f64 = rtts.iter().sum();
+    let rtt_min = rtts.iter().cloned().fold(f64::NAN, f64::min);
+    let rtt_max = rtts.iter().cloned().fold(f64::NAN, f64::max);
+    let rtt_min = if rtt_min.is_nan() { None } else { Some(rtt_min) };
+    let rtt_max = if rtt_max.is_nan() { None } else { Some(rtt_max) };
+    let mut jitter_sum = 0.0;
+    let mut jitter_n = 0i64;
+    for w in rtts.windows(2) {
+        jitter_sum += (w[1] - w[0]).abs();
+        jitter_n += 1;
+    }
+    conn.execute(
+        "INSERT INTO rollup_hourly(device_id, hour, probes, ups, rtt_sum, rtt_min, rtt_max,
+                                   jitter_sum, jitter_n)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(device_id, hour) DO UPDATE SET
+             probes = excluded.probes, ups = excluded.ups, rtt_sum = excluded.rtt_sum,
+             rtt_min = excluded.rtt_min, rtt_max = excluded.rtt_max,
+             jitter_sum = excluded.jitter_sum, jitter_n = excluded.jitter_n",
+        params![device_id, hour_start_secs, probes, ups, rtt_sum, rtt_min, rtt_max, jitter_sum, jitter_n],
+    )?;
+    Ok(())
+}
+
+/// Aggregate finished hours into daily rollups (pure SQL, run periodically).
+pub fn refresh_daily_rollups(conn: &Connection, day_start_secs: i64) -> Result<()> {
+    let lo = day_start_secs;
+    let hi = lo + 86_400;
+    conn.execute(
+        "INSERT INTO rollup_daily(device_id, day, probes, ups, rtt_sum)
+         SELECT device_id, ?1, SUM(probes), SUM(ups), SUM(rtt_sum)
+         FROM rollup_hourly WHERE hour >= ?1 AND hour < ?2
+         GROUP BY device_id
+         ON CONFLICT(device_id, day) DO UPDATE SET
+             probes = excluded.probes, ups = excluded.ups, rtt_sum = excluded.rtt_sum",
+        params![day_start_secs, hi],
+    )?;
+    Ok(())
+}
+
+pub fn recent_rtt_series(conn: &Connection, device_id: i64, limit: usize) -> Result<Vec<(i64, Option<f64>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT ts, rtt_ms FROM samples WHERE device_id = ?1 AND up = 1
+         ORDER BY ts DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![device_id, limit as i64], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?))
+    })?;
+    let mut v: Vec<_> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    v.reverse();
+    Ok(v)
+}
+
+pub fn uptime_pct_window(conn: &Connection, device_id: i64, since_secs: i64) -> Option<f64> {
+    conn.query_row(
+        "SELECT 100.0 * SUM(ups) / NULLIF(SUM(probes), 0)
+         FROM rollup_hourly WHERE device_id = ?1 AND hour >= ?2",
+        params![device_id, since_secs],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+pub fn mttr_secs_window(conn: &Connection, since_secs: i64) -> Option<f64> {
+    conn.query_row(
+        "SELECT AVG(ended_ts - started_ts) FROM segments
+         WHERE state = 'down' AND ended_ts IS NOT NULL AND started_ts >= ?1",
+        params![since_secs],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+// ---------------------------------------------------------------- segments
+
+pub fn open_segment(conn: &Connection, device_id: i64, state: &str, ts: i64) -> Result<i64> {
+    close_open_segments(conn, device_id, ts)?;
+    conn.execute(
+        "INSERT INTO segments(device_id, state, started_ts) VALUES (?1, ?2, ?3)",
+        params![device_id, state, ts],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn close_open_segments(conn: &Connection, device_id: i64, ts: i64) -> Result<usize> {
+    conn.execute(
+        "UPDATE segments SET ended_ts = ?2 WHERE device_id = ?1 AND ended_ts IS NULL",
+        params![device_id, ts],
+    )
+    .map_err(Into::into)
+}
+
+pub fn current_segment(conn: &Connection, device_id: i64) -> Result<Option<Segment>> {
+    let res = conn
+        .query_row(
+            "SELECT id, device_id, state, started_ts, ended_ts FROM segments
+             WHERE device_id = ?1 AND ended_ts IS NULL ORDER BY started_ts DESC LIMIT 1",
+            params![device_id],
+            |r| {
+                Ok(Segment {
+                    id: r.get(0)?,
+                    device_id: r.get(1)?,
+                    state: r.get(2)?,
+                    started_ts: r.get(3)?,
+                    ended_ts: r.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(res)
+}
+
+pub fn segments_window(conn: &Connection, device_id: i64, since_secs: i64, limit: usize) -> Result<Vec<Segment>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, device_id, state, started_ts, ended_ts FROM segments
+         WHERE device_id = ?1 AND started_ts >= ?2 ORDER BY started_ts DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![device_id, since_secs, limit as i64], |r| {
+        Ok(Segment {
+            id: r.get(0)?,
+            device_id: r.get(1)?,
+            state: r.get(2)?,
+            started_ts: r.get(3)?,
+            ended_ts: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+// ------------------------------------------------------------------ events
+
+fn row_event(r: &Row) -> rusqlite::Result<EventRec> {
+    Ok(EventRec {
+        id: r.get(0)?,
+        created_ts: r.get(1)?,
+        updated_ts: r.get(2)?,
+        device_id: r.get(3)?,
+        ip: r.get(4)?,
+        kind: r.get(5)?,
+        severity: r.get(6)?,
+        state: r.get(7)?,
+        message: r.get(8)?,
+        details: r.get(9)?,
+        acknowledged: r.get::<_, i64>(10)? != 0,
+        ack_by: r.get(11)?,
+        ack_ts: r.get(12)?,
+        cleared_ts: r.get(13)?,
+    })
+}
+
+const EVENT_COLS: &str = "id, created_ts, updated_ts, device_id, ip, kind, severity, state, \
+     message, details, acknowledged, ack_by, ack_ts, cleared_ts";
+
+pub fn open_event_for(conn: &Connection, device_id: i64, kind: &str) -> Result<Option<EventRec>> {
+    let sql = format!(
+        "SELECT {EVENT_COLS} FROM events
+         WHERE device_id = ?1 AND kind = ?2 AND state = 'open'
+         ORDER BY created_ts DESC LIMIT 1"
+    );
+    Ok(conn
+        .query_row(&sql, params![device_id, kind], |r| row_event(r))
+        .optional()?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_event(
+    conn: &Connection,
+    device_id: Option<i64>,
+    ip: Option<&str>,
+    kind: &str,
+    severity: &str,
+    message: &str,
+    details: Option<&str>,
+    ts: i64,
+) -> Result<EventRec> {
+    conn.execute(
+        "INSERT INTO events(created_ts, device_id, ip, kind, severity, state, message, details)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
+        params![ts, device_id, ip, kind, severity, message, details],
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(EventRec {
+        id,
+        created_ts: ts,
+        updated_ts: None,
+        device_id,
+        ip: ip.map(str::to_string),
+        kind: kind.into(),
+        severity: severity.into(),
+        state: "open".into(),
+        message: message.into(),
+        details: details.map(str::to_string),
+        acknowledged: false,
+        ack_by: None,
+        ack_ts: None,
+        cleared_ts: None,
+    })
+}
+
+pub fn update_event_details(conn: &Connection, id: i64, details: &str, ts: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE events SET details = ?2, updated_ts = ?3 WHERE id = ?1",
+        params![id, details, ts],
+    )?;
+    Ok(())
+}
+
+pub fn clear_event(conn: &Connection, id: i64, ts: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE events SET state = 'closed', cleared_ts = ?2, updated_ts = ?2 WHERE id = ?1",
+        params![id, ts],
+    )?;
+    Ok(())
+}
+
+pub fn clear_open_events_of_kind(conn: &Connection, device_id: i64, kinds: &[&str], ts: i64) -> Result<usize> {
+    let mut n = 0;
+    for k in kinds {
+        n += conn.execute(
+            "UPDATE events SET state = 'closed', cleared_ts = ?3, updated_ts = ?3
+             WHERE device_id = ?1 AND kind = ?2 AND state = 'open'",
+            params![device_id, k, ts],
+        )?;
+    }
+    Ok(n)
+}
+
+pub fn ack_event(conn: &Connection, id: i64, ack: bool, by: &str, ts: i64) -> Result<usize> {
+    if ack {
+        conn.execute(
+            "UPDATE events SET acknowledged = 1, ack_by = ?2, ack_ts = ?3 WHERE id = ?1",
+            params![id, by, ts],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE events SET acknowledged = 0, ack_by = NULL, ack_ts = NULL WHERE id = ?1",
+            params![id],
+        )?;
+    }
+    Ok(1)
+}
+
+pub fn list_events(
+    conn: &Connection,
+    only_open: bool,
+    severity: Option<&str>,
+    device_id: Option<i64>,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<EventRec>> {
+    use rusqlite::types::Value;
+    let mut sql = format!("SELECT {EVENT_COLS} FROM events WHERE 1=1");
+    let mut args: Vec<Value> = Vec::new();
+    if only_open {
+        sql.push_str(" AND state = 'open'");
+    }
+    if let Some(sev) = severity {
+        args.push(Value::Text(sev.to_string()));
+        sql.push_str(&format!(" AND severity = ?{}", args.len()));
+    }
+    if let Some(did) = device_id {
+        args.push(Value::Integer(did));
+        sql.push_str(&format!(" AND device_id = ?{}", args.len()));
+    }
+    args.push(Value::Integer(limit));
+    sql.push_str(&format!(" ORDER BY created_ts DESC, id DESC LIMIT ?{}", args.len()));
+    args.push(Value::Integer(offset));
+    sql.push_str(&format!(" OFFSET ?{}", args.len()));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| row_event(r))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub fn event_counts(conn: &Connection) -> (i64, i64, i64) {
+    let open_crit_warn: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE state='open' AND severity IN ('critical','warning')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let unacked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE state='open' AND acknowledged = 0
+             AND severity IN ('critical','warning')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .unwrap_or(0);
+    (open_crit_warn, unacked, total)
+}
+
+// ---------------------------------------------------------- outbound queue
+
+pub fn queue_outbound(conn: &Connection, event_id: i64, payload: &str, ts: i64) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO outbound(created_ts, status, event_id, payload) VALUES (?1, 'pending', ?2, ?3)",
+        params![ts, event_id, payload],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn pending_outbound(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, payload FROM outbound
+         WHERE status = 'pending' AND tries < 5 ORDER BY created_ts LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub fn mark_outbound(conn: &Connection, id: i64, ok: bool, err: Option<&str>) -> Result<()> {
+    if ok {
+        conn.execute(
+            "UPDATE outbound SET status='sent', sent_ts=?2, tries=tries+1, last_error=NULL WHERE id=?1",
+            params![id, now()],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE outbound SET tries=tries+1, last_error=?2,
+                 status=CASE WHEN tries+1 >= 5 THEN 'failed' ELSE 'pending' END
+             WHERE id=?1",
+            params![id, err.unwrap_or("unknown")],
+        )?;
+    }
+    Ok(())
+}
+
+// --------------------------------------------------------------- retention
+
+pub fn prune_old_data(
+    conn: &Connection,
+    raw_cutoff_secs: i64,
+    hourly_cutoff_secs: i64,
+    daily_cutoff_secs: i64,
+) -> Result<(usize, usize, usize)> {
+    let raw_cut_ms = raw_cutoff_secs * 1000;
+    let mut raw = 0usize;
+    loop {
+        let deleted = conn.execute(
+            "DELETE FROM samples WHERE rowid IN
+                 (SELECT rowid FROM samples WHERE ts < ?1 LIMIT 20000)",
+            params![raw_cut_ms],
+        )?;
+        raw += deleted;
+        if deleted == 0 {
+            break;
+        }
+    }
+    let mut hourly = 0usize;
+    loop {
+        let deleted = conn.execute(
+            "DELETE FROM rollup_hourly WHERE hour < ?1 AND hour IN
+                 (SELECT hour FROM rollup_hourly WHERE hour < ?1 LIMIT 50000)",
+            params![hourly_cutoff_secs],
+        )?;
+        hourly += deleted;
+        if deleted == 0 {
+            break;
+        }
+    }
+    let mut daily = 0usize;
+    loop {
+        let deleted = conn.execute(
+            "DELETE FROM rollup_daily WHERE day < ?1 AND day IN
+                 (SELECT day FROM rollup_daily WHERE day < ?1 LIMIT 50000)",
+            params![daily_cutoff_secs],
+        )?;
+        daily += deleted;
+        if deleted == 0 {
+            break;
+        }
+    }
+    Ok((raw, hourly, daily))
+}
+
+pub fn purge_sent_outbound(conn: &Connection, older_than_secs: i64) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM outbound WHERE status IN ('sent','failed') AND created_ts < ?1",
+        params![older_than_secs],
+    )
+    .map_err(Into::into)
+}
+
+pub fn epoch_day(ts: i64) -> i64 {
+    ts - ts.rem_euclid(86_400)
+}
+
+pub fn epoch_hour(ts_millis: i64) -> i64 {
+    let secs = ts_millis / 1000;
+    secs - secs.rem_euclid(3600)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> Db {
+        Db::open_memory().unwrap()
+    }
+
+    #[test]
+    fn settings_roundtrip_and_defaults() {
+        let db = setup();
+        let c = db.lock();
+        assert_eq!(get_setting_or(&c, "poll_interval_secs", "x"), "60");
+        set_setting(&c, "poll_interval_secs", "30").unwrap();
+        assert_eq!(get_setting_or(&c, "poll_interval_secs", "x"), "30");
+        assert!(all_settings(&c).contains_key("webhook_url"));
+    }
+
+    #[test]
+    fn device_upsert_preserves_manual_site() {
+        let db = setup();
+        let mut c = db.lock();
+        let u = DeviceUpdate {
+            ip: "10.0.0.5",
+            mac: None,
+            role: "endpoint",
+            subnet_site_label: Some("10.0.0/24".into()),
+            parent_ip: None,
+            state: "up",
+            up_now: true,
+            rtt_ms: Some(5.0),
+            ts: 1_000,
+            site_prefix: 24,
+        };
+        let d1 = upsert_device(&c, &u).unwrap();
+        assert_eq!(site_name(&c, d1.site_id), "10.0.0/24");
+        assign_site(&c, d1.id, Some("hq-building-3")).unwrap();
+        let d2 = upsert_device(&c, &u).unwrap();
+        assert_eq!(site_name(&c, d2.site_id), "hq-building-3");
+        assert_eq!(d2.site_source, "manual");
+    }
+
+    #[test]
+    fn event_lifecycle() {
+        let db = setup();
+        let c = db.lock();
+        let ev = create_event(&c, Some(1), Some("10.0.0.5"), "device_down", "critical",
+                              "router down", None, 100).unwrap();
+        assert!(open_event_for(&c, 1, "device_down").unwrap().is_some());
+        ack_event(&c, ev.id, true, "web", 110).unwrap();
+        clear_event(&c, ev.id, 120).unwrap();
+        let got = list_events(&c, false, None, None, 0, 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].state, "closed");
+        assert!(got[0].acknowledged);
+        assert_eq!(got[0].cleared_ts, Some(120));
+        assert!(list_events(&c, true, None, None, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn segments_close_and_reopen() {
+        let db = setup();
+        let c = db.lock();
+        open_segment(&c, 7, "up", 100).unwrap();
+        open_segment(&c, 7, "down", 200).unwrap();
+        let cur = current_segment(&c, 7).unwrap().unwrap();
+        assert_eq!(cur.state, "down");
+        assert_eq!(cur.started_ts, 200);
+        let closed = segments_window(&c, 7, 0, 10).unwrap();
+        assert_eq!(closed.len(), 2);
+        let prev = closed.iter().find(|s| s.id != cur.id).unwrap();
+        assert_eq!(prev.ended_ts, Some(200));
+    }
+
+    #[test]
+    fn hourly_rollup_math_with_jitter() {
+        let db = setup();
+        let c = db.lock();
+        let base: i64 = 1_700_000_000_000;
+        let mk = |i: i64, up: bool, rtt: Option<f64>| Sample {
+            device_id: 42,
+            ts_millis: base + i * 60_000,
+            up,
+            rtt_ms: rtt,
+        };
+        insert_samples(&c, &[
+            mk(0, true, Some(10.0)),
+            mk(1, true, Some(20.0)),
+            mk(2, true, Some(15.0)),
+            mk(3, false, None),
+        ])
+        .unwrap();
+        recompute_hourly_rollup(&c, 42, base / 1000 - base / 1000 % 3600).unwrap();
+        let pct = uptime_pct_window(&c, 42, 0).unwrap();
+        assert!((pct - 75.0).abs() < 0.001);
+        let jit: f64 = c
+            .query_row(
+                "SELECT jitter_sum / jitter_n FROM rollup_hourly WHERE device_id=42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((jit - 7.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn daily_rollup_from_hourly() {
+        let db = setup();
+        let c = db.lock();
+        let day = 1_700_000_000 - 1_700_000_000 % 86_400;
+        for h in 0..3i64 {
+            c.execute(
+                "INSERT INTO rollup_hourly(device_id,hour,probes,ups,rtt_sum) VALUES (1,?1,10,9,90.0)",
+                params![day + h * 3600],
+            )
+            .unwrap();
+        }
+        refresh_daily_rollups(&c, day).unwrap();
+        let (probes, ups): (i64, i64) = c
+            .query_row("SELECT probes, ups FROM rollup_daily WHERE device_id=1 AND day=?1",
+                       params![day], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((probes, ups), (30, 27));
+    }
+
+    #[test]
+    fn retention_prunes() {
+        let db = setup();
+        let c = db.lock();
+        insert_samples(&c, &[Sample { device_id: 1, ts_millis: 1_000, up: true, rtt_ms: Some(1.0) }])
+            .unwrap();
+        c.execute("INSERT INTO rollup_hourly(device_id,hour,probes,ups) VALUES (1, 10, 1, 1)", [])
+            .unwrap();
+        c.execute("INSERT INTO rollup_daily(device_id,day,probes,ups) VALUES (1, 10, 1, 1)", [])
+            .unwrap();
+        let (raw, hr, dy) = prune_old_data(&c, 2_000, 100, 100).unwrap();
+        assert_eq!((raw, hr, dy), (1, 1, 1));
+        let left: i64 = c.query_row("SELECT COUNT(*) FROM samples", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn auto_site_labels() {
+        assert_eq!(auto_site_label("192.168.86.20", 24).unwrap(), "192.168.86/24");
+        assert_eq!(auto_site_label("10.1.2.3", 16).unwrap(), "10.1/16");
+        assert!(auto_site_label("not-an-ip", 24).is_none());
+    }
+
+    #[test]
+    fn outbound_queue_flow() {
+        let db = setup();
+        let c = db.lock();
+        let id = queue_outbound(&c, 9, "{\"x\":1}", 5).unwrap();
+        assert_eq!(pending_outbound(&c, 10).unwrap().len(), 1);
+        mark_outbound(&c, id, false, Some("conn refused")).unwrap();
+        assert_eq!(pending_outbound(&c, 10).unwrap().len(), 1);
+        mark_outbound(&c, id, true, None).unwrap();
+        assert!(pending_outbound(&c, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_appends() {
+        let db = setup();
+        let c = db.lock();
+        audit(&c, "web", "event.ack", "event:3", "{}");
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+}

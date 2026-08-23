@@ -12,6 +12,8 @@ chrono = "0.4"
 rand = "0.8"
 ipnet = { version = "2", features = ["serde"] }
 if-addrs = "0.13"
+rusqlite = { version = "0.32", features = ["bundled"] }
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 [target.'cfg(unix)'.dependencies]
 socket2 = "0.5"

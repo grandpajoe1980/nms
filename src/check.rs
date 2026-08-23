@@ -29,9 +29,17 @@ pub struct Transition {
     pub to: State,
 }
 
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub ip: Ipv4Addr,
+    pub up: bool,
+    pub rtt_ms: Option<f64>,
+}
+
 pub struct RunResult {
     pub model: Model,
     pub transitions: Vec<Transition>,
+    pub probes: Vec<Probe>,
     pub up: usize,
     pub down: usize,
     pub probed: usize,
@@ -209,6 +217,11 @@ pub fn sweep_once(p: &Params) -> Result<RunResult> {
     model.devices.sort_by_key(|d| u32::from(d.ip));
 
     let unprobed = outcomes.iter().filter(|o| !o.probed).count();
+    let probes: Vec<Probe> = outcomes
+        .iter()
+        .filter(|o| o.probed)
+        .map(|o| Probe { ip: o.ip, up: o.up, rtt_ms: if o.up { o.rtt_ms } else { None } })
+        .collect();
 
     model.generated_at = Utc::now().to_rfc3339();
     model.scan_duration_ms = t0.elapsed().as_millis() as u64;
@@ -222,7 +235,7 @@ pub fn sweep_once(p: &Params) -> Result<RunResult> {
     let html = report::render(&model, 3500)?;
     std::fs::write(p.out_dir.join("map.html"), html)?;
 
-    Ok(RunResult { model, transitions, up: up_c, down: down_c, probed: up_c + down_c, unprobed })
+    Ok(RunResult { model, transitions, probes, up: up_c, down: down_c, probed: up_c + down_c, unprobed })
 }
 
 pub fn run(p: Params) -> Result<Model> {
