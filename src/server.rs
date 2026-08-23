@@ -8,7 +8,7 @@ use anyhow::Result;
 use ipnet::Ipv4Net;
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,32 +105,135 @@ fn handle(stream: TcpStream, shared: Arc<Shared>, p: Params) {
     if reader.read_line(&mut request).is_err() || request.is_empty() {
         return;
     }
+    let mut content_length = 0usize;
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
             Ok(0) | Err(_) => break,
             Ok(_) if header == "\r\n" || header == "\n" => break,
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(v) = header
+                    .to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|s| s.trim().parse().ok())
+                {
+                    content_length = v;
+                }
+            }
+        }
+    }
+    let mut body = String::new();
+    if content_length > 0 && content_length < 64 * 1024 {
+        let mut buf = vec![0u8; content_length];
+        if reader.read_exact(&mut buf).is_ok() {
+            body = String::from_utf8_lossy(&buf).into_owned();
         }
     }
     let mut parts = request.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let response = route(method, path, query, &shared, &p);
+    let response = route(method, path, query, &body, &shared, &p);
     let _ = writer.write_all(&response);
     let _ = writer.flush();
 }
 
-fn route(method: &str, path: &str, query: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 2;
+                } else {
+                    out.push(b'%');
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn form_value(form: &str, key: &str) -> Option<String> {
+    form.split('&')
+        .filter_map(|part| part.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| url_decode(v))
+}
+
+fn html(status: &str, page: String) -> Vec<u8> {
+    response(status, "text/html; charset=utf-8", page.into_bytes())
+}
+
+fn route(method: &str, path: &str, query: &str, body: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
     match (method, path) {
-        ("GET", "/") | ("GET", "/index.html") => {
-            match Model::load(&p.out_dir.join("model.json")) {
-                Ok(model) => match report::render(&model, 3500) {
-                    Ok(page) => response("200 OK", "text/html; charset=utf-8", page.into_bytes()),
-                    Err(e) => text("500 Internal Server Error", format!("map render failed: {e}")),
-                },
-                Err(_) => response("200 OK", "text/html; charset=utf-8", NO_MODEL_HTML.as_bytes().to_vec()),
+        ("GET", "/") | ("GET", "/index.html") => map_page(shared, p),
+        ("GET", "/map") => map_page(shared, p),
+        ("GET", "/console") => html("200 OK", crate::ui::dashboard(&shared.store.lock())),
+        ("GET", "/devices") => html(
+            "200 OK",
+            crate::ui::devices_page(
+                &shared.store.lock(),
+                &url_decode(&query_param(query, "state").unwrap_or_default()),
+                &url_decode(&query_param(query, "q").unwrap_or_default()),
+            ),
+        ),
+        ("GET", "/events") => {
+            let view = query_param(query, "view");
+            let sev = query_param(query, "severity").filter(|s| !s.is_empty());
+            let only_open = view.as_deref() != Some("all");
+            html("200 OK", crate::ui::events_page(&shared.store.lock(), only_open, sev.as_deref()))
+        }
+        ("GET", "/audit") => html("200 OK", crate::ui::audit_page(&shared.store.lock())),
+        ("GET", "/settings") => {
+            let saved = query_param(query, "saved").as_deref() == Some("1");
+            html("200 OK", crate::ui::settings_page(&shared.store.lock(), saved))
+        }
+        ("GET", "/reports") => {
+            let hours: i64 = query_param(query, "hours")
+                .and_then(|h| h.parse().ok())
+                .unwrap_or(24);
+            html("200 OK", crate::ui::reports_page(&shared.store.lock(), hours.clamp(1, 24 * 45)))
+        }
+        ("GET", "/api/report/availability.csv") => {
+            let hours: i64 = query_param(query, "hours").and_then(|h| h.parse().ok()).unwrap_or(24);
+            text_csv(
+                "200 OK",
+                crate::ui::availability_csv(&shared.store.lock(), hours.clamp(1, 24 * 45)),
+            )
+        }
+        ("GET", "/api/report/devices.csv") => {
+            let hours: i64 = query_param(query, "hours").and_then(|h| h.parse().ok()).unwrap_or(24);
+            let site = query_param(query, "site").filter(|s| !s.is_empty());
+            text_csv(
+                "200 OK",
+                crate::ui::devices_csv(&shared.store.lock(), hours.clamp(1, 24 * 45), site.as_deref()),
+            )
+        }
+        ("POST", "/api/settings") => settings_save(body, shared),
+        ("POST", "/api/device") => device_action(body, shared),
+        ("POST", "/api/event/ack") => event_ack(body, shared),
+        ("POST", "/api/webhook/test") => webhook_test(shared),
+        ("GET", "/api/dashboard.json") => dashboard_json(shared),
+        _ if method == "GET" && path.starts_with("/device/") && !path.ends_with(".json") => {
+            let ip = url_decode(path.trim_start_matches("/device/"));
+            html("200 OK", crate::ui::device_detail(&shared.store.lock(), &ip))
+        }
+        _ if method == "GET" && path.starts_with("/api/device/") && path.ends_with(".json") => {
+            let ip = url_decode(
+                path.trim_start_matches("/api/device/")
+                    .trim_end_matches(".json"),
+            );
+            match db::device_by_ip(&shared.store.lock(), &ip) {
+                Ok(Some(d)) => json("200 OK", serde_json::to_value(&d).unwrap_or_default()),
+                _ => json("404 Not Found", serde_json::json!({"error":"unknown device"})),
             }
         }
         ("GET", "/api/model") => match std::fs::read(p.out_dir.join("model.json")) {
@@ -179,6 +282,188 @@ fn response(status: &str, content_type: &str, body: Vec<u8>) -> Vec<u8> {
     .into_bytes();
     out.extend_from_slice(&body);
     out
+}
+
+fn see_other(location: &str) -> Vec<u8> {
+    format!("HTTP/1.1 303 See Other\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .into_bytes()
+}
+
+fn text_csv(status: &str, body: String) -> Vec<u8> {
+    response(status, "text/csv; charset=utf-8", body.into_bytes())
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.to_string())
+}
+
+fn map_page(shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
+    let _ = shared;
+    match Model::load(&p.out_dir.join("model.json")) {
+        Ok(model) => match report::render(&model, 3500) {
+            Ok(page) => html("200 OK", page),
+            Err(e) => text("500 Internal Server Error", format!("map render failed: {e}")),
+        },
+        Err(_) => response(
+            "200 OK",
+            "text/html; charset=utf-8",
+            NO_MODEL_HTML.as_bytes().to_vec(),
+        ),
+    }
+}
+
+fn dashboard_json(shared: &Arc<Shared>) -> Vec<u8> {
+    use std::collections::BTreeMap;
+    let conn = shared.store.lock();
+    let now = chrono::Utc::now().timestamp();
+    let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT eff_state, COUNT(*) FROM devices WHERE managed=1 GROUP BY eff_state")
+    {
+        for (k, v) in stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            *counts.entry(k).or_default() += v;
+        }
+    }
+    let trend: Vec<(i64, f64)> = conn
+        .prepare(
+            "SELECT hour, 100.0*SUM(ups)/MAX(SUM(probes),1) FROM rollup_hourly
+             WHERE hour >= ?1 GROUP BY hour ORDER BY hour",
+        )
+        .ok()
+        .and_then(|mut s| {
+            s.query_map([now - 86_400], |r| Ok((r.get(0)?, r.get(1)?)))
+                .ok()?
+                .flatten()
+                .collect::<Vec<_>>()
+                .into()
+        })
+        .unwrap_or_default();
+    let worst: Vec<(String, String, f64)> = conn
+        .prepare(
+            "SELECT d.ip, d.role, SUM(r.rtt_sum)/MAX(SUM(r.ups),1)
+             FROM rollup_hourly r JOIN devices d ON d.id=r.device_id
+             WHERE r.hour >= ?1 AND r.ups > 0
+             GROUP BY r.device_id ORDER BY avg_rtt DESC LIMIT 10",
+        )
+        .ok()
+        .and_then(|mut s| {
+            s.query_map([now - 3600], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .ok()?
+                .flatten()
+                .collect::<Vec<_>>()
+                .into()
+        })
+        .unwrap_or_default();
+    let (open, unacked, total) = db::event_counts(&conn);
+    json(
+        "200 OK",
+        serde_json::json!({
+            "devices": counts,
+            "sites": conn.query_row("SELECT COUNT(*) FROM sites", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
+            "events": {"open": open, "unacked": unacked, "total": total},
+            "availability_trend_24h": trend,
+            "worst_latency_1h": worst,
+        }),
+    )
+}
+
+fn settings_save(body: &str, shared: &Arc<Shared>) -> Vec<u8> {
+    let conn = shared.store.lock();
+    let mut changed = 0usize;
+    for pair in body.split('&') {
+        let Some((k, v)) = pair.split_once('=') else { continue };
+        let key = url_decode(k);
+        let val = url_decode(v);
+        if db::DEFAULT_SETTINGS.iter().any(|(known, _)| *known == key)
+            && db::set_setting(&conn, &key, &val).is_ok()
+        {
+            changed += 1;
+        }
+    }
+    db::audit(&conn, "web", "settings.save", "", &format!("updated {changed} setting(s)"));
+    see_other("/settings?saved=1")
+}
+
+fn device_action(body: &str, shared: &Arc<Shared>) -> Vec<u8> {
+    let Some(ip) = form_value(body, "ip") else {
+        return json("400 Bad Request", serde_json::json!({"error":"ip required"}));
+    };
+    let action = form_value(body, "action").unwrap_or_default();
+    let value = form_value(body, "value").unwrap_or_default();
+    let conn = shared.store.lock();
+    let Some(dev) = db::device_by_ip(&conn, &ip).ok().flatten() else {
+        return json("404 Not Found", serde_json::json!({"error":"unknown device"}));
+    };
+    let ok = match action.as_str() {
+        "maintenance" => {
+            let until = if value == "off" || value.is_empty() {
+                None
+            } else {
+                value.parse::<i64>().ok().map(|mins| chrono::Utc::now().timestamp() + mins * 60)
+            };
+            db::set_maintenance(&conn, dev.id, until)
+        }
+        "site" => {
+            let name = if value.trim().is_empty() { None } else { Some(value.trim()) };
+            db::assign_site(&conn, dev.id, name)
+        }
+        "managed" => db::set_managed(&conn, dev.id, value != "0"),
+        _ => Err(anyhow::anyhow!("unknown action")),
+    };
+    let status = match &ok {
+        Ok(_) => {
+            db::audit(&conn, "web", &format!("device.{action}"), &ip, &value);
+            see_other(&format!("/device/{ip}"))
+        }
+        Err(e) => json("400 Bad Request", serde_json::json!({"error": e.to_string()})),
+    };
+    status
+}
+
+fn event_ack(body: &str, shared: &Arc<Shared>) -> Vec<u8> {
+    let Some(id) = form_value(body, "id").and_then(|v| v.parse::<i64>().ok()) else {
+        return json("400 Bad Request", serde_json::json!({"error":"id required"}));
+    };
+    let ack = form_value(body, "ack").as_deref() != Some("0");
+    let conn = shared.store.lock();
+    let _ = db::ack_event(&conn, id, ack, "web", chrono::Utc::now().timestamp());
+    db::audit(&conn, "web", "event.ack", &format!("event:{id}"), &format!("ack={ack}"));
+    see_other("/events")
+}
+
+fn webhook_test(shared: &Arc<Shared>) -> Vec<u8> {
+    let conn = shared.store.lock();
+    let url = db::get_setting_or(&conn, "webhook_url", "");
+    if url.is_empty() {
+        return json("400 Bad Request", serde_json::json!({"error":"webhook_url is not configured"}));
+    }
+    let payload = serde_json::json!({
+        "type": "nms.test",
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "message": "NMS webhook connectivity test",
+    });
+    let result = ureq::post(&url)
+        .timeout(Duration::from_secs(10))
+        .send_json(payload);
+    match result {
+        Ok(resp) => {
+            db::audit(&conn, "web", "webhook.test", &url, &format!("status={}", resp.status()));
+            json("200 OK", serde_json::json!({"sent": true, "status": resp.status()}))
+        }
+        Err(e) => {
+            db::audit(&conn, "web", "webhook.test", &url, &format!("failed: {e}"));
+            json("502 Bad Gateway", serde_json::json!({"sent": false, "error": e.to_string()}))
+        }
+    }
 }
 
 fn text(status: &str, body: String) -> Vec<u8> {

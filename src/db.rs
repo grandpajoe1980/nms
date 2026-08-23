@@ -27,7 +27,7 @@ pub struct Db {
     conn: Mutex<Connection>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct DeviceRec {
     pub id: i64,
     pub ip: String,

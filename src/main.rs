@@ -12,6 +12,7 @@ mod ping;
 mod report;
 mod routes;
 mod server;
+mod ui;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
