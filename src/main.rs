@@ -3,6 +3,7 @@ mod check;
 mod db;
 mod discover;
 mod engine;
+mod jobs;
 mod model;
 mod monitor;
 mod netutil;
@@ -262,6 +263,9 @@ fn main() -> Result<()> {
             print_summary(&res.model);
         }
         Cmd::Monitor { interval_secs, exec, subnets, rate, concurrency, timeout_ms, max_targets, budget_secs, confirm_down, out } => {
+            let store = Arc::new(db::Db::open(&out.join("ops.db"))?);
+            jobs::start_housekeeping(Arc::clone(&store));
+            jobs::start_webhook_sender(Arc::clone(&store));
             monitor::run(monitor::Params {
                 check: check::Params {
                     extra_subnets: parse_subnets(subnets)?,

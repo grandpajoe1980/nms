@@ -79,6 +79,8 @@ pub fn run(p: Params) -> Result<()> {
     let url = format!("http://{addr}");
     println!("[*] NMS control panel: {url}");
     println!("[*] Ctrl+C stops the web server and any in-process monitor loop");
+    crate::jobs::start_housekeeping(Arc::clone(&shared.store));
+    crate::jobs::start_webhook_sender(Arc::clone(&shared.store));
     if !p.no_open {
         let _ = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
     }
@@ -451,17 +453,14 @@ fn webhook_test(shared: &Arc<Shared>) -> Vec<u8> {
         "ts": chrono::Utc::now().to_rfc3339(),
         "message": "NMS webhook connectivity test",
     });
-    let result = ureq::post(&url)
-        .timeout(Duration::from_secs(10))
-        .send_json(payload);
-    match result {
-        Ok(resp) => {
-            db::audit(&conn, "web", "webhook.test", &url, &format!("status={}", resp.status()));
-            json("200 OK", serde_json::json!({"sent": true, "status": resp.status()}))
+    match crate::jobs::send_webhook(&url, payload) {
+        Ok(status) => {
+            db::audit(&conn, "web", "webhook.test", &url, &format!("status={status}"));
+            json("200 OK", serde_json::json!({"sent": true, "status": status}))
         }
         Err(e) => {
             db::audit(&conn, "web", "webhook.test", &url, &format!("failed: {e}"));
-            json("502 Bad Gateway", serde_json::json!({"sent": false, "error": e.to_string()}))
+            json("502 Bad Gateway", serde_json::json!({"sent": false, "error": e}))
         }
     }
 }
@@ -579,8 +578,16 @@ fn start_monitor(shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
 }
 
 fn monitor_loop(shared: Arc<Shared>, p: Params) {
-    let interval = Duration::from_secs(p.interval_secs.max(5));
     while shared.monitoring.load(Ordering::Relaxed) {
+        let interval = {
+            let conn = shared.store.lock();
+            Duration::from_secs(
+                db::get_setting_or(&conn, "poll_interval_secs", &p.interval_secs.to_string())
+                    .parse()
+                    .unwrap_or(p.interval_secs)
+                    .max(5),
+            )
+        };
         let started = std::time::Instant::now();
         {
             let _engine = shared.engine_lock.lock().unwrap();
