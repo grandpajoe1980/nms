@@ -290,6 +290,19 @@ CREATE TABLE IF NOT EXISTS api_tokens(
   disabled   INTEGER NOT NULL DEFAULT 0,
   created_ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS interfaces(
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id   INTEGER NOT NULL REFERENCES devices(id),
+  if_index    INTEGER NOT NULL,
+  name        TEXT,
+  speed_bps   INTEGER,
+  admin_status TEXT,
+  oper_status TEXT,
+  mac         TEXT,
+  last_seen_ts INTEGER NOT NULL,
+  UNIQUE(device_id, if_index)
+);
+CREATE INDEX IF NOT EXISTS idx_interfaces_device ON interfaces(device_id);
 "#;
 
 // ---------------------------------------------------------------- settings
@@ -1425,5 +1438,88 @@ mod tests {
         add_api_token(&c, "h1", "ansible", "automation").unwrap();
         assert_eq!(api_token_role(&c, "h1").unwrap().as_deref(), Some("automation"));
         assert!(api_token_role(&c, "missing").unwrap().is_none());
+    }
+}
+
+// -------------------------------------------------------------- interfaces
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct IfaceRow {
+    pub if_index: i64,
+    pub name: Option<String>,
+    pub speed_bps: Option<i64>,
+    pub admin_status: Option<String>,
+    pub oper_status: Option<String>,
+    pub mac: Option<String>,
+}
+
+/// Replace the stored interface list for one device atomically (FR-DISC-003).
+pub fn replace_interfaces(conn: &Connection, device_id: i64, rows: &[IfaceRow], ts: i64) -> Result<()> {
+    conn.execute("DELETE FROM interfaces WHERE device_id = ?1", params![device_id])?;
+    for r in rows {
+        conn.execute(
+            "INSERT INTO interfaces(device_id, if_index, name, speed_bps, admin_status,
+                 oper_status, mac, last_seen_ts)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![device_id, r.if_index, r.name, r.speed_bps, r.admin_status,
+                    r.oper_status, r.mac, ts],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn list_interfaces(conn: &Connection, device_id: i64) -> Result<Vec<IfaceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT if_index, name, speed_bps, admin_status, oper_status, mac
+         FROM interfaces WHERE device_id = ?1 ORDER BY if_index",
+    )?;
+    let rows = stmt.query_map(params![device_id], |r| {
+        Ok(IfaceRow {
+            if_index: r.get(0)?,
+            name: r.get(1)?,
+            speed_bps: r.get(2)?,
+            admin_status: r.get(3)?,
+            oper_status: r.get(4)?,
+            mac: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub fn count_interfaces(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM interfaces", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod iface_tests {
+    use super::*;
+
+    #[test]
+    fn interface_replace_and_list() {
+        let db = Db::open_memory().unwrap();
+        let c = db.lock();
+        c.execute(
+            "INSERT INTO devices(ip, role, first_seen_ts, last_seen_ts) VALUES
+             ('10.0.0.9','router',1,2)", [],
+        ).unwrap();
+        let dev: i64 = c.query_row("SELECT id FROM devices WHERE ip='10.0.0.9'", [], |r| r.get(0)).unwrap();
+        let rows = vec![
+            IfaceRow { if_index: 1, name: Some("eth0".into()), speed_bps: Some(1_000_000_000),
+                       admin_status: Some("up".into()), oper_status: Some("up".into()),
+                       mac: Some("aa:bb:cc:dd:ee:01".into()) },
+            IfaceRow { if_index: 2, name: Some("eth1".into()), speed_bps: None,
+                       admin_status: Some("down".into()), oper_status: Some("down".into()),
+                       mac: None },
+        ];
+        replace_interfaces(&c, dev, &rows, 555).unwrap();
+        assert_eq!(list_interfaces(&c, dev).unwrap().len(), 2);
+        assert_eq!(count_interfaces(&c), 2);
+        // second replace with fewer rows = full replacement, not append
+        replace_interfaces(&c, dev, &rows[..1], 666).unwrap();
+        let now = list_interfaces(&c, dev).unwrap();
+        assert_eq!(now.len(), 1);
+        assert_eq!(now[0].name.as_deref(), Some("eth0"));
+        assert_eq!(count_interfaces(&c), 1);
     }
 }

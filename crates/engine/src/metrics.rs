@@ -56,6 +56,18 @@ pub fn render(conn: &Connection) -> String {
         "known sites",
         count(conn, "SELECT COUNT(*) FROM sites").to_string(),
     );
+    push(
+        &mut out,
+        "nms_interfaces_total",
+        "known interfaces",
+        count(conn, "SELECT COUNT(*) FROM interfaces").to_string(),
+    );
+    push(
+        &mut out,
+        "nms_interfaces_oper_up",
+        "interfaces with oper_status 'up'",
+        count(conn, "SELECT COUNT(*) FROM interfaces WHERE oper_status='up'").to_string(),
+    );
 
     out.push_str("# HELP nms_alarms_open open alarms by severity\n# TYPE nms_alarms_open gauge\n");
     for sev in ["critical", "warning", "info"] {
@@ -110,6 +122,8 @@ mod tests {
         assert!(m.contains("nms_devices_up 0"));
         assert!(m.contains("nms_devices_total 0"));
         assert!(m.contains("nms_sites 0"));
+        assert!(m.contains("nms_interfaces_total 0"));
+        assert!(m.contains("nms_interfaces_oper_up 0"));
         assert!(m.contains("nms_alarms_open{severity=\"critical\"} 0"));
         assert!(m.contains(&format!("nms_build_info{{version=\"{}\"}} 1", env!("CARGO_PKG_VERSION"))));
         assert!(m.starts_with("# HELP nms_devices_up "));

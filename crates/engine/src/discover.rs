@@ -511,6 +511,60 @@ pub fn run(p: Params) -> Result<Model> {
             }
         }
         println!("[*] snmp enrichment applied to {enriched} host(s)");
+
+        // ---- interface inventory via ifTable walk (FR-DISC-003 v0):
+        // routers/WAPs first-class, but any live host is walked; failures are
+        // per-device and non-fatal.
+        use crate::db;
+        let now_ts = chrono::Utc::now().timestamp();
+        let mut if_total = 0usize;
+        let mut iface_rows: HashMap<Ipv4Addr, Vec<db::IfaceRow>> = HashMap::new();
+        for chunk in live.chunks(32) {
+            let collected: std::sync::Mutex<Vec<(Ipv4Addr, Vec<db::IfaceRow>)>> =
+                std::sync::Mutex::new(Vec::new());
+            std::thread::scope(|s| {
+                for &i in chunk {
+                    let ip = devices[i].ip;
+                    let collected = &collected;
+                    let community = &p.snmp_community;
+                    s.spawn(move || {
+                        let addr =
+                            std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 161);
+                        if let Ok(entries) =
+                            snmp::walk_if_table(addr, community, 600, 64)
+                        {
+                            let rows: Vec<db::IfaceRow> = entries.into_iter().map(iface_entry_to_row).collect();
+                            if !rows.is_empty() {
+                                collected.lock().unwrap().push((ip, rows));
+                            }
+                        }
+                    });
+                }
+            });
+            for (ip, rows) in collected.into_inner().unwrap() {
+                if_total += rows.len();
+                iface_rows.insert(ip, rows);
+            }
+        }
+        if !iface_rows.is_empty() {
+            match db::Db::open(&p.out_dir.join("ops.db")) {
+                Ok(store) => {
+                    let conn = store.lock();
+                    for (ip, rows) in &iface_rows {
+                        if let Ok(Some(dev)) = db::device_by_ip(&conn, &ip.to_string()) {
+                            let _ = db::replace_interfaces(&conn, dev.id, rows, now_ts);
+                        }
+                    }
+                    drop(conn);
+                    println!(
+                        "[*] snmp: stored {} interface(s) across {} host(s)",
+                        if_total,
+                        iface_rows.len()
+                    );
+                }
+                Err(e) => eprintln!("[!] snmp interfaces: store unavailable: {e}"),
+            }
+        }
     }
 
     let mut edges: BTreeSet<(String, String, String)> = BTreeSet::new();
@@ -558,4 +612,39 @@ pub fn run(p: Params) -> Result<Model> {
     println!("[*] wrote {}", model_path.display());
     println!("[*] wrote {}", p.out_dir.join("map.html").display());
     Ok(model)
+}
+
+/// Convert a collector-snmp ifTable entry into a storable row (unit-tested
+/// seam between the protocol crate and the ops store).
+fn iface_entry_to_row(e: snmp::IfaceEntry) -> crate::db::IfaceRow {
+    crate::db::IfaceRow {
+        if_index: e.if_index,
+        name: e.name,
+        speed_bps: e.speed_bps,
+        admin_status: e.admin_status,
+        oper_status: e.oper_status,
+        mac: e.mac,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iface_entry_maps_all_fields() {
+        let row = iface_entry_to_row(snmp::IfaceEntry {
+            if_index: 3,
+            name: Some("Gi0/1".into()),
+            speed_bps: Some(1_000_000_000),
+            admin_status: Some("up".into()),
+            oper_status: Some("down".into()),
+            mac: Some("aa:bb:cc:dd:ee:ff".into()),
+        });
+        assert_eq!(row.if_index, 3);
+        assert_eq!(row.name.as_deref(), Some("Gi0/1"));
+        assert_eq!(row.speed_bps, Some(1_000_000_000));
+        assert_eq!(row.oper_status.as_deref(), Some("down"));
+        assert!(row.mac.is_some());
+    }
 }

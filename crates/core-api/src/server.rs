@@ -7,7 +7,7 @@ use engine::model::{Model, State};
 use engine::report;
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -53,6 +53,45 @@ struct Shared {
     last_stats: Mutex<Option<engine::ops::CycleStats>>,
     started_ts: i64,
     hardened: bool,
+    // Brute-force throttle state (FR-PLAT-005): username -> (failures, last
+    // failure unix secs). NOTE: in-memory only — counters reset on restart and
+    // each replica throttles independently; persistent/distributed rate
+    // limiting arrives with the Postgres path (PRD §6).
+    login_failures: Mutex<HashMap<String, (u32, i64)>>,
+}
+
+/// Failed attempts allowed per username within the throttle window before it
+/// locks; the 6th failure trips the lock.
+const LOGIN_MAX_FAILURES: u32 = 6;
+/// Throttle window and lockout duration (seconds).
+const LOGIN_WINDOW_SECS: i64 = 10 * 60;
+
+/// Pure decision core for login throttling: true when an attempt should be
+/// rejected outright because `count` failures were recorded at `last_ts`
+/// (unix secs) and `now` is still inside the window.
+fn throttle_decision(count: u32, last_ts: i64, now: i64) -> bool {
+    count >= LOGIN_MAX_FAILURES && now.saturating_sub(last_ts) < LOGIN_WINDOW_SECS
+}
+
+fn login_throttled(shared: &Shared, username: &str, now: i64) -> bool {
+    match shared.login_failures.lock().unwrap().get(username) {
+        Some(&(count, last_ts)) => throttle_decision(count, last_ts, now),
+        None => false,
+    }
+}
+
+fn record_login_failure(shared: &Shared, username: &str, now: i64) {
+    let mut map = shared.login_failures.lock().unwrap();
+    let entry = match map.get(username) {
+        Some(&(count, last_ts)) if now.saturating_sub(last_ts) < LOGIN_WINDOW_SECS => {
+            (count + 1, now)
+        }
+        _ => (1, now),
+    };
+    if map.len() >= 4096 {
+        map.retain(|_, (_, ts)| now.saturating_sub(*ts) < LOGIN_WINDOW_SECS);
+    }
+    map.insert(username.to_string(), entry);
 }
 
 /// Resolve the authenticated role for a request, if any.
@@ -75,11 +114,15 @@ fn resolve_role(shared: &Shared, authorization: Option<&str>, cookie: Option<&st
 }
 
 fn login_page(err: Option<&str>) -> Vec<u8> {
+    login_page_status("200 OK", err)
+}
+
+fn login_page_status(status: &str, err: Option<&str>) -> Vec<u8> {
     let err_html = err
         .map(|e| format!(r#"<div class="err">{}</div>"#, crate::ui::esc(e)))
         .unwrap_or_default();
     html(
-        "200 OK",
+        status,
         format!(
             r#"<!doctype html><html><head><meta charset="utf-8"><title>NMS login</title><style>
 body{{background:#0b1020;color:#dbe4f5;font:14px system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}
@@ -110,6 +153,39 @@ fn unauthorized(api: bool) -> Vec<u8> {
         json("401 Unauthorized", serde_json::json!({"error": "authentication required"}))
     } else {
         see_other("/login")
+    }
+}
+
+/// Hardened-mode login with per-username brute-force throttling (FR-PLAT-005).
+fn login_submit(body: &str, shared: &Arc<Shared>) -> Vec<u8> {
+    let username = form_value(body, "username").unwrap_or_default();
+    let password = form_value(body, "password").unwrap_or_default();
+    let now = chrono::Utc::now().timestamp();
+    if shared.hardened && login_throttled(shared, &username, now) {
+        db::audit(&shared.store.lock(), "web:anonymous", "auth.throttled", &username, "");
+        return login_page_status(
+            "429 Too Many Requests",
+            Some("too many failed attempts; try again in a few minutes"),
+        );
+    }
+    let user = db::get_user(&shared.store.lock(), &username)
+        .ok()
+        .flatten()
+        .filter(|u| !u.disabled);
+    match user {
+        Some(u) if engine::auth::verify_password(&password, &u.password_hash) => {
+            shared.login_failures.lock().unwrap().remove(&username);
+            let (raw, hashed) = engine::auth::new_token();
+            let expires = chrono::Utc::now().timestamp() + 7 * 86_400;
+            let _ = db::create_session(&shared.store.lock(), &hashed, u.id, &u.role, expires);
+            db::audit(&shared.store.lock(), &format!("web:{}", u.username), "auth.login", &u.username, "");
+            session_response(&raw, 7 * 86_400)
+        }
+        _ => {
+            record_login_failure(shared, &username, now);
+            db::audit(&shared.store.lock(), "web:anonymous", "auth.failure", &username, "");
+            login_page(Some("invalid username or password"))
+        }
     }
 }
 
@@ -155,6 +231,7 @@ pub fn run(p: Params) -> Result<()> {
         last_stats: Mutex::new(None),
         started_ts: chrono::Utc::now().timestamp(),
         hardened,
+        login_failures: Mutex::new(HashMap::new()),
         store,
     });
     let url = format!("http://{addr}");
@@ -362,27 +439,7 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
         ),
         ("GET", "/api/search") => search_endpoint(query, shared),
         ("GET", "/login") => login_page(None),
-        ("POST", "/login") => {
-            let username = form_value(body, "username").unwrap_or_default();
-            let password = form_value(body, "password").unwrap_or_default();
-            let user = db::get_user(&shared.store.lock(), &username)
-                .ok()
-                .flatten()
-                .filter(|u| !u.disabled);
-            match user {
-                Some(u) if engine::auth::verify_password(&password, &u.password_hash) => {
-                    let (raw, hashed) = engine::auth::new_token();
-                    let expires = chrono::Utc::now().timestamp() + 7 * 86_400;
-                    let _ = db::create_session(&shared.store.lock(), &hashed, u.id, &u.role, expires);
-                    db::audit(&shared.store.lock(), &format!("web:{}", u.username), "auth.login", &u.username, "");
-                    session_response(&raw, 7 * 86_400)
-                }
-                _ => {
-                    db::audit(&shared.store.lock(), "web:anonymous", "auth.failure", &username, "");
-                    login_page(Some("invalid username or password"))
-                }
-            }
-        }
+        ("POST", "/login") => login_submit(body, shared),
         ("POST", "/logout") => {
             if let Some(raw) = cookie.and_then(|c| c.split(';').find_map(|p| p.trim().strip_prefix("nms_session="))) {
                 let hashed = engine::auth::token_hash(raw);
@@ -1289,7 +1346,35 @@ mod tests {
             last_stats: Mutex::new(None),
             started_ts: chrono::Utc::now().timestamp(),
             hardened: false,
+            login_failures: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn hardened_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            job: Mutex::new(Job::Idle),
+            message: Mutex::new("ready".into()),
+            monitoring: Arc::new(AtomicBool::new(false)),
+            engine_lock: Mutex::new(()),
+            revision: AtomicU64::new(0),
+            events: Mutex::new(VecDeque::new()),
+            store: Arc::new(engine::db::Db::open_memory().unwrap()),
+            last_stats: Mutex::new(None),
+            started_ts: chrono::Utc::now().timestamp(),
+            hardened: true,
+            login_failures: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn test_params() -> Params {
+        Params {
+            port: 0,
+            bind: "127.0.0.1".into(),
+            no_open: true,
+            interval_secs: 30,
+            extra_subnets: vec![],
+            out_dir: PathBuf::from("output"),
+        }
     }
 
     #[test]
@@ -1320,5 +1405,93 @@ mod tests {
         assert_eq!(v["components"]["database"]["status"], "ok");
         assert_eq!(v["components"]["scheduler"]["status"], "idle");
         assert_eq!(v["components"]["webhook_queue"]["pending"], 0);
+    }
+
+    #[test]
+    fn throttle_allows_below_six_failures_inside_window() {
+        assert!(!throttle_decision(0, 1_000, 1_000));
+        assert!(!throttle_decision(5, 1_000, 1_000 + LOGIN_WINDOW_SECS - 1));
+    }
+
+    #[test]
+    fn throttle_blocks_from_sixth_failure_until_window_elapses() {
+        assert!(throttle_decision(6, 1_000, 1_000));
+        assert!(throttle_decision(6, 1_000, 1_000 + LOGIN_WINDOW_SECS - 1));
+        assert!(throttle_decision(9, 1_000, 1_000 + LOGIN_WINDOW_SECS - 1));
+        // Lockout lifts once the window has fully elapsed since the last failure.
+        assert!(!throttle_decision(6, 1_000, 1_000 + LOGIN_WINDOW_SECS));
+        assert!(!throttle_decision(50, 1_000, 1_000 + LOGIN_WINDOW_SECS * 3));
+    }
+
+    #[test]
+    fn throttle_rejects_before_password_check_and_audits() {
+        let shared = hardened_shared();
+        let p = test_params();
+        let body = "username=ghost&password=wrong";
+        for attempt in 0..6 {
+            let resp = route("POST", "/login", "", body, None, &shared, &p);
+            let text = String::from_utf8(resp).unwrap();
+            assert!(
+                text.starts_with("HTTP/1.1 200 OK"),
+                "attempt {attempt} should pass through: {text}"
+            );
+            assert!(text.contains("invalid username or password"), "{text}");
+        }
+        // 7th attempt: throttled regardless of password correctness...
+        let resp = route("POST", "/login", "", body, None, &shared, &p);
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 429 Too Many Requests"), "{text}");
+        assert!(text.contains("too many failed attempts"), "{text}");
+        // ...even with the correct password (unknown user here: still 429).
+        let conn = shared.store.lock();
+        let throttled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action='auth.throttled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(throttled, 1, "every rejection writes an auth.throttled audit entry");
+    }
+
+    #[test]
+    fn successful_login_clears_failure_counter() {
+        let shared = hardened_shared();
+        let p = test_params();
+        {
+            let conn = shared.store.lock();
+            let hash = engine::auth::hash_password("correct horse").unwrap();
+            db::create_user(&conn, "alice", &hash, "viewer").unwrap();
+        }
+        let wrong = "username=alice&password=wrong";
+        for _ in 0..3 {
+            route("POST", "/login", "", wrong, None, &shared, &p);
+        }
+        let good = "username=alice&password=correct+horse";
+        let resp = route("POST", "/login", "", good, None, &shared, &p);
+        assert!(
+            String::from_utf8(resp).unwrap().starts_with("HTTP/1.1 303"),
+            "valid credentials must log in"
+        );
+        // Counter cleared by success: 5 further failures must NOT trip the lock.
+        for _ in 0..5 {
+            let resp = route("POST", "/login", "", wrong, None, &shared, &p);
+            assert!(String::from_utf8(resp).unwrap().starts_with("HTTP/1.1 200 OK"));
+        }
+        assert!(!login_throttled(&shared, "alice", chrono::Utc::now().timestamp()));
+        // The 6th failure after the successful login trips it again.
+        route("POST", "/login", "", wrong, None, &shared, &p);
+        assert!(login_throttled(&shared, "alice", chrono::Utc::now().timestamp()));
+    }
+
+    #[test]
+    fn open_mode_login_is_not_throttled() {
+        let shared = test_shared(); // hardened=false
+        let p = test_params();
+        let body = "username=ghost&password=wrong";
+        for _ in 0..10 {
+            let resp = route("POST", "/login", "", body, None, &shared, &p);
+            assert!(String::from_utf8(resp).unwrap().starts_with("HTTP/1.1 200 OK"));
+        }
     }
 }

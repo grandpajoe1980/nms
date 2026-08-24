@@ -119,6 +119,77 @@ fn ac_flt_004_router_failure_yields_one_incident_with_impacted_children() {
     );
 }
 
+/// Site power blip: every device drops together and recovers next cycle,
+/// five times in a row. Storm-suppression contract (AC-FLT-004 pattern):
+/// one critical per outage episode for the root cause, zero per-endpoint
+/// criticals while children are merely unreachable, clean board afterwards.
+#[test]
+fn site_power_blip_yields_one_root_critical_per_episode_and_zero_endpoint_storm() {
+    let (dbh, model, dir) = setup();
+    let router = "10.20.30.1";
+    let endpoints = ["10.20.30.50", "10.20.30.51", "10.20.30.52"];
+    let site_blackout: &[&str] =
+        &[router, endpoints[0], endpoints[1], endpoints[2]];
+
+    // Baseline: healthy site raises nothing.
+    let base = ops::process_result(&dbh, &run_for(&model, &[]), dir.path()).unwrap();
+    assert_eq!(base.down_root, 0);
+    assert!(open_criticals(&dbh).is_empty(), "healthy baseline must raise nothing");
+
+    // Five down/up pairs simulating power blips at the site PDU.
+    for i in 0..5 {
+        let out = ops::process_result(&dbh, &run_for(&model, site_blackout), dir.path())
+            .unwrap();
+        assert_eq!(out.down_root, 1, "blip {i}: only the router is a root outage");
+        assert_eq!(out.unreachable, 3, "blip {i}: children suppressed as unreachable");
+
+        let back = ops::process_result(&dbh, &run_for(&model, &[]), dir.path()).unwrap();
+        assert_eq!(back.down_root, 0, "blip {i}: recovery cycle");
+        assert_eq!(back.unreachable, 0, "blip {i}: recovery cycle");
+    }
+
+    // Final stable up cycle.
+    ops::process_result(&dbh, &run_for(&model, &[]), dir.path()).unwrap();
+
+    // (a) Deduped router criticals: exactly one per outage episode, never
+    // re-created on every cycle of an ongoing outage.
+    let router_criticals: i64 = dbh
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind='device_down' AND severity='critical'
+                 AND device_id = (SELECT id FROM devices WHERE ip=?1)",
+            [router],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        (5..=6).contains(&router_criticals),
+        "expected ~one device_down critical per episode, got {router_criticals} \
+         (>6 means re-alerting while down; <5 means missing episodes)"
+    );
+
+    // (b) Zero per-endpoint criticals ever: suppressed as unreachable.
+    let endpoint_criticals: i64 = dbh
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE severity='critical'
+                 AND device_id IN (?1, ?2, ?3)",
+            [endpoints[0], endpoints[1], endpoints[2]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        endpoint_criticals, 0,
+        "unreachable endpoints must never raise critical events"
+    );
+
+    // (c) After the final stable cycle, no open criticals remain.
+    assert!(
+        open_criticals(&dbh).is_empty(),
+        "stable site must auto-clear every critical"
+    );
+}
+
 #[test]
 fn flap_damping_raises_one_warning_then_stays_quiet() {
     let (dbh, model, dir) = setup();

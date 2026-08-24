@@ -114,6 +114,44 @@ fn hhmm(ts: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Humanize interface link speed (bps → Gbps/Mbps/kbps), FR-DISC-003.
+fn speed_str(bps: Option<i64>) -> String {
+    let Some(b) = bps else { return "-".into() };
+    if b <= 0 {
+        return "-".into();
+    }
+    if b >= 1_000_000_000 {
+        if b % 1_000_000_000 == 0 {
+            format!("{} Gbps", b / 1_000_000_000)
+        } else {
+            format!("{:.1} Gbps", b as f64 / 1e9)
+        }
+    } else if b >= 1_000_000 {
+        format!("{} Mbps", b / 1_000_000)
+    } else {
+        format!("{} kbps", b / 1_000)
+    }
+}
+
+/// Colorized admin/oper status chip: up=green, down=red, other values plain.
+fn if_status(v: Option<&str>) -> String {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        None => "-".to_string(),
+        Some(s) => {
+            let color = match s.to_ascii_lowercase().as_str() {
+                "up" => "var(--up)",
+                "down" => "var(--down)",
+                _ => "",
+            };
+            if color.is_empty() {
+                esc(s)
+            } else {
+                format!("<span style=\"color:{color}\">{}</span>", esc(s))
+            }
+        }
+    }
+}
+
 /// Inline SVG polyline chart, auto-scaled min/max.
 fn svg_line(points: &[(i64, f64)], w: u32, h: u32, color: &str, unit: &str) -> String {
     if points.len() < 2 {
@@ -486,6 +524,37 @@ pingOne();
             children.len());
     }
 
+    // interface inventory (FR-DISC-003)
+    let ifaces = db::list_interfaces(conn, d.id).unwrap_or_default();
+    if ifaces.is_empty() && d.role == "endpoint" {
+        let _ = write!(body,
+            "<p class=\"muted\" style=\"margin:10px 0\">No interface inventory collected for this \
+             endpoint yet \u{2014} interfaces appear after SNMP/LLDP discovery (FR-DISC-003).</p>");
+    } else {
+        let mut irows = String::new();
+        for i in &ifaces {
+            let _ = write!(irows,
+                "<tr><td class=\"mono\">{}</td><td>{}</td><td class=\"mono\">{}</td>\
+<td>{}</td><td>{}</td><td class=\"mono\">{}</td></tr>",
+                i.if_index,
+                esc(i.name.as_deref().unwrap_or("-")),
+                speed_str(i.speed_bps),
+                if_status(i.admin_status.as_deref()),
+                if_status(i.oper_status.as_deref()),
+                esc(i.mac.as_deref().unwrap_or("-")));
+        }
+        let table = if irows.is_empty() {
+            "<span class=\"muted\">no interfaces discovered yet</span>".to_string()
+        } else {
+            format!(
+                "<table><tr><th>ifIndex</th><th>name</th><th>speed</th><th>admin</th>\
+<th>oper</th><th>MAC</th></tr>{irows}</table>"
+            )
+        };
+        let _ = write!(body,
+            "<div class=\"panel\" style=\"margin:10px 0\"><h2>Interfaces ({})</h2>{table}</div>",
+            ifaces.len());
+    }
     let chart = svg_line(&spark, 600, 120, "var(--info)", "ms");
     let timeline = svg_timeline(&segs, now - 86_400, now);
     let _ = write!(body,
@@ -887,4 +956,108 @@ fn urlencode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::db::{Db, DeviceUpdate, IfaceRow};
+
+    fn upsert(conn: &Connection, ip: &str, role: &str) -> i64 {
+        db::upsert_device(
+            conn,
+            &DeviceUpdate {
+                ip,
+                mac: None,
+                role,
+                subnet_site_label: None,
+                parent_ip: None,
+                state: "up",
+                up_now: true,
+                rtt_ms: Some(1.0),
+                ts: 1_000,
+                site_prefix: 24,
+                hostname: None,
+                device_class: None,
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn speed_str_humanizes() {
+        assert_eq!(speed_str(None), "-");
+        assert_eq!(speed_str(Some(0)), "-");
+        assert_eq!(speed_str(Some(1_000_000_000)), "1 Gbps");
+        assert_eq!(speed_str(Some(10_000_000_000)), "10 Gbps");
+        assert_eq!(speed_str(Some(2_500_000_000)), "2.5 Gbps");
+        assert_eq!(speed_str(Some(100_000_000)), "100 Mbps");
+        assert_eq!(speed_str(Some(10_000_000)), "10 Mbps");
+    }
+
+    #[test]
+    fn if_status_colors_up_down() {
+        assert_eq!(
+            if_status(Some("up")),
+            "<span style=\"color:var(--up)\">up</span>"
+        );
+        assert_eq!(
+            if_status(Some("down")),
+            "<span style=\"color:var(--down)\">down</span>"
+        );
+        assert_eq!(if_status(Some("testing")), "testing");
+        assert_eq!(if_status(None), "-");
+        // names/statuses are escaped before embedding
+        assert_eq!(if_status(Some("<x>")), "&lt;x&gt;");
+    }
+
+    #[test]
+    fn endpoint_without_interfaces_shows_muted_line_not_panel() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        upsert(&conn, "10.9.0.1", "endpoint");
+        let html = device_detail(&conn, "10.9.0.1");
+        assert!(html.contains("No interface inventory collected for this endpoint"));
+        assert!(!html.contains("<h2>Interfaces"));
+    }
+
+    #[test]
+    fn router_always_shows_interface_panel_header() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        upsert(&conn, "10.9.0.2", "router");
+        let html = device_detail(&conn, "10.9.0.2");
+        assert!(html.contains("<h2>Interfaces (0)</h2>"));
+        assert!(html.contains("no interfaces discovered yet"));
+    }
+
+    #[test]
+    fn interface_rows_render_speed_and_statuses() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        let id = upsert(&conn, "10.9.0.3", "router");
+        db::replace_interfaces(
+            &conn,
+            id,
+            &[IfaceRow {
+                if_index: 1,
+                name: Some("eth<0>".into()),
+                speed_bps: Some(1_000_000_000),
+                admin_status: Some("up".into()),
+                oper_status: Some("down".into()),
+                mac: Some("aa:bb:cc:dd:ee:ff".into()),
+            }],
+            1_500,
+        )
+        .unwrap();
+        let html = device_detail(&conn, "10.9.0.3");
+        assert!(html.contains("<h2>Interfaces (1)</h2>"));
+        assert!(html.contains(">eth&lt;0&gt;<"));
+        assert!(html.contains("1 Gbps"));
+        assert!(html.contains("color:var(--up)\">up<"));
+        assert!(html.contains("color:var(--down)\">down<"));
+        assert!(html.contains("aa:bb:cc:dd:ee:ff"));
+        assert!(html.contains("<th>ifIndex</th>"));
+    }
 }

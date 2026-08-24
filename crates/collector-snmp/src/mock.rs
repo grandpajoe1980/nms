@@ -1,7 +1,9 @@
-//! Mock SNMP agent used by the fixture tests: answers v2c GETs for a fixed
-//! varbind table, enforcing community checks.
+//! Mock SNMP agent used by the fixture tests: answers v2c GET (exact match)
+//! and GETNEXT (lexicographic successor over the varbind table, so arbitrary
+//! subtree walks work), enforcing community checks. Past the last varbind it
+//! reports v2c `endOfMibView`.
 
-use crate::{build_response_v2c, parse_response, SnmpValue};
+use crate::{build_response_v2c, cmp_oid, parse_message, SnmpValue, TAG_PDU_GETNEXT};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -39,20 +41,35 @@ pub fn spawn(
     sock.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
     let handle = std::thread::spawn(move || {
         let mut buf = [0u8; 65535];
+        let mut keys: Vec<String> = table.keys().cloned().collect();
+        keys.sort_by(|a, b| cmp_oid(a, b));
         while !sd.load(std::sync::atomic::Ordering::Relaxed) {
             match sock.recv_from(&mut buf) {
                 Ok((n, src)) => {
-                    let Ok((rid, _err, req_vbs)) = parse_response(&buf[..n]) else {
+                    let Ok(msg) = parse_message(&buf[..n]) else {
                         continue;
                     };
-                    // Community check: decode is lossy here; real enforcement
-                    // lives in the codec tests. The mock just answers.
                     let mut out_vbs = Vec::new();
-                    for (oid, _) in req_vbs {
-                        let v = table.get(&oid).cloned().unwrap_or(SnmpValue::Null);
-                        out_vbs.push((oid, v));
+                    match msg.pdu_tag {
+                        TAG_PDU_GETNEXT => {
+                            for (oid, _) in msg.varbinds {
+                                match keys.iter().find(|k| cmp_oid(k, &oid) == std::cmp::Ordering::Greater) {
+                                    Some(k) => out_vbs.push((
+                                        k.clone(),
+                                        table.get(k).cloned().unwrap_or(SnmpValue::Null),
+                                    )),
+                                    None => out_vbs.push((oid, SnmpValue::EndOfMibView)),
+                                }
+                            }
+                        }
+                        _ => {
+                            for (oid, _) in msg.varbinds {
+                                let v = table.get(&oid).cloned().unwrap_or(SnmpValue::Null);
+                                out_vbs.push((oid, v));
+                            }
+                        }
                     }
-                    if let Ok(resp) = build_response_v2c(community, rid, &out_vbs) {
+                    if let Ok(resp) = build_response_v2c(community, msg.request_id, &out_vbs) {
                         let _ = sock.send_to(&resp, src);
                     }
                 }
