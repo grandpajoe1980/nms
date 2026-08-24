@@ -78,6 +78,8 @@ enum Cmd {
         walks: usize,
         #[arg(long, help = "profile live endpoints: names, open ports, device class")]
         deep: bool,
+        #[arg(long, default_value = "public", help = "SNMPv2c community for identity probing (empty disables)")]
+        snmp_community: String,
         #[arg(long, default_value_t = 30, help = "retire inventory devices unseen this many days")]
         retire_days: u64,
         #[arg(long, help = "do not auto-seed from local interfaces/routes")]
@@ -232,6 +234,7 @@ fn main() -> Result<()> {
             walks,
             deep,
             retire_days,
+            snmp_community,
             no_auto,
             out,
         } => {
@@ -255,6 +258,7 @@ fn main() -> Result<()> {
                 walk_budget: walks,
                 deep,
                 retire_days,
+                snmp_community,
             })?;
             let store = engine::db::Db::open(&out.join("ops.db"))?;
             {

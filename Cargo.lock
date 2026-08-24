@@ -648,6 +648,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "chrono",
+ "collector-snmp",
  "dns-lookup",
  "if-addrs",
  "ipnet",

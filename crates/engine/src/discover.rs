@@ -28,6 +28,8 @@ pub struct Params {
     pub walk_budget: usize,
     /// profile live endpoints: reverse-DNS names, TCP port fingerprint, class
     pub deep: bool,
+    /// SNMPv2c community for identity probing; empty disables SNMP enrichment
+    pub snmp_community: String,
     /// drop previously-seen devices unseen longer than this many days
     pub retire_days: u64,
 }
@@ -446,6 +448,69 @@ pub fn run(p: Params) -> Result<Model> {
             }
         }
         println!("[*] profiled {} host(s)", map.len());
+    }
+
+    // ---- SNMP identity enrichment (FR-PRF-003 v0): sysName/sysDescr
+    if !p.snmp_community.is_empty() {
+        let live: Vec<usize> = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.state == State::Up)
+            .map(|(i, _)| i)
+            .collect();
+        println!(
+            "[*] snmp: probing {} live host(s) (community '{}')",
+            live.len(),
+            if p.snmp_community == "public" { "public" } else { "***" }
+        );
+        let mut enriched = 0usize;
+        let community = p.snmp_community.clone();
+        for chunk in live.chunks(32) {
+            let results: std::sync::Mutex<HashMap<usize, crate::snmpprobe::SnmpIdentity>> =
+                std::sync::Mutex::new(HashMap::new());
+            std::thread::scope(|s| {
+                for &i in chunk {
+                    let ip = devices[i].ip;
+                    let results = &results;
+                    let community = &community;
+                    s.spawn(move || {
+                        let addr =
+                            std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 161);
+                        if let Ok(id) = crate::snmpprobe::probe_identity(
+                            addr,
+                            community,
+                            400,
+                        ) {
+                            results.lock().unwrap().insert(i, id);
+                        }
+                    });
+                }
+            });
+            for (i, id) in results.into_inner().unwrap() {
+                let d = &mut devices[i];
+                if d.hostname.is_none() {
+                    d.hostname = id.sys_name.clone();
+                }
+                if let Some(descr) = &id.sys_descr {
+                    let tag = match crate::snmpprobe::classify_os(descr) {
+                        Some((vendor, os)) => format!("[SNMP] {vendor} {os}"),
+                        None => format!(
+                            "[SNMP] {}",
+                            descr.chars().take(60).collect::<String>()
+                        ),
+                    };
+                    match &mut d.hint {
+                        Some(h) if !h.contains("[SNMP]") => h.push_str(&format!(" {tag}")),
+                        Some(_) => {}
+                        none => *none = Some(tag),
+                    }
+                    enriched += 1;
+                } else if d.hostname.is_some() {
+                    enriched += 1;
+                }
+            }
+        }
+        println!("[*] snmp enrichment applied to {enriched} host(s)");
     }
 
     let mut edges: BTreeSet<(String, String, String)> = BTreeSet::new();

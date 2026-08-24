@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+collector-snmp = { path = "../collector-snmp" }
 rand.workspace = true
 ipnet.workspace = true
 if-addrs.workspace = true

@@ -43,7 +43,7 @@ performance, configuration management):
 | pillar | what nms does today |
 |---|---|
 | discovery & inventory | auto-crawl of interface subnets + scannable routes; device registry in SQLite (role, MAC, site, parent); sites auto-derived per /16 or /24; manual site assignment wins |
-| **deep endpoint profiling** | `discover --deep` (default from the web panel) reverse-DNS names, light TCP port fingerprinting (14 common ports), OUI vendor hints → device class: printer / NAS / server / computer / mobile / IoT / TV / appliance |
+| **deep endpoint profiling** | `discover --deep` (default from the web panel) reverse-DNS names, light TCP port fingerprinting (14 common ports), OUI vendor hints, **SNMP v2c identity probes** (`--snmp-community public`; sysName→hostname, sysDescr→vendor/OS) → device class: printer / NAS / server / computer / mobile / IoT / TV / appliance |
 | fault management | continuous sweeps; up/down/unreachable states; **dependency-aware root-cause suppression** (a downed router collapses all its endpoints into one incident with an impacted-device count); flapping detection & damping; maintenance windows; acknowledge workflow |
 | performance management | RTT samples + hourly/daily rollups; latency warning/critical thresholds; rolling loss detection ("degraded"); jitter accounting |
 | diagnostics | per-device burst ping: loss %, min/avg/max/p95 RTT, jitter, link-quality score 0-100 (ICMP responsiveness — not Mbps bandwidth); port/service list with **expected-service checks** per device class |

@@ -21,6 +21,7 @@ pub mod progress;
 pub mod report;
 pub mod reports;
 pub mod routes;
+pub mod snmpprobe;
 pub mod trace;
 
 /// Convenience re-exports for CLI consumers.

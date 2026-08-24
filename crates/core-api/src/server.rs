@@ -987,6 +987,7 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
             scan: ScanParams { rate_pps: 2000.0, concurrency: 512, timeout_ms: 500, payload_len: 32 },
             out_dir: p.out_dir.clone(),
             walk_budget: 24,
+            snmp_community: "public".into(),
             deep: true,
             retire_days: 30,
         })
