@@ -555,6 +555,41 @@ pingOne();
             "<div class=\"panel\" style=\"margin:10px 0\"><h2>Interfaces ({})</h2>{table}</div>",
             ifaces.len());
     }
+
+    // discovered neighbors via LLDP/CDP (FR-DISC-004)
+    let nbrs = db::list_neighbors(conn, d.id).unwrap_or_default();
+    let nbody = if nbrs.is_empty() {
+        "<span class=\"muted\">No LLDP/CDP neighbors reported yet</span>".to_string()
+    } else {
+        let disp = |v: &Option<String>| {
+            esc(v.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("-"))
+        };
+        let mut rows = String::new();
+        for n in &nbrs {
+            let proto = n.protocol.trim();
+            let proto_cell = if proto.is_empty() {
+                "-".to_string()
+            } else {
+                format!("<span class=\"badge b-info\">{}</span>", esc(proto))
+            };
+            let _ = write!(rows,
+                "<tr><td>{proto_cell}</td><td class=\"mono\">{port}</td>\
+<td>{sys}<br><span class=\"mono muted\">{ip} \u{b7} {mac}</span></td><td>{plat}</td></tr>",
+                port = disp(&n.local_if_name),
+                sys = disp(&n.neighbor_sysname),
+                ip = disp(&n.neighbor_ip),
+                mac = disp(&n.neighbor_mac),
+                plat = disp(&n.neighbor_platform));
+        }
+        format!(
+            "<table><tr><th>proto</th><th>local port</th>\
+<th>neighbor (sysname / ip / mac)</th><th>platform</th></tr>{rows}</table>"
+        )
+    };
+    let _ = write!(body,
+        "<div class=\"panel\" style=\"margin:10px 0\"><h2>Discovered neighbors ({})</h2>{nbody}</div>",
+        nbrs.len());
+
     let chart = svg_line(&spark, 600, 120, "var(--info)", "ms");
     let timeline = svg_timeline(&segs, now - 86_400, now);
     let _ = write!(body,
@@ -961,7 +996,7 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::db::{Db, DeviceUpdate, IfaceRow};
+    use engine::db::{Db, DeviceUpdate, IfaceRow, NeighborRow};
 
     fn upsert(conn: &Connection, ip: &str, role: &str) -> i64 {
         db::upsert_device(
@@ -1059,5 +1094,67 @@ mod tests {
         assert!(html.contains("color:var(--down)\">down<"));
         assert!(html.contains("aa:bb:cc:dd:ee:ff"));
         assert!(html.contains("<th>ifIndex</th>"));
+    }
+
+    #[test]
+    fn device_without_neighbors_shows_muted_line_not_table() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        upsert(&conn, "10.9.0.4", "router");
+        let html = device_detail(&conn, "10.9.0.4");
+        assert!(html.contains("No LLDP/CDP neighbors reported yet"));
+        assert!(!html.contains("<th>proto</th>"));
+    }
+
+    #[test]
+    fn neighbor_rows_render_badge_fields_and_escaping() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        let id = upsert(&conn, "10.9.0.5", "router");
+        db::replace_neighbors(
+            &conn,
+            id,
+            &[NeighborRow {
+                local_if_name: Some("Gi0/<1>".into()),
+                neighbor_ip: Some("10.0.0.2".into()),
+                neighbor_mac: Some("aa:bb:cc:dd:ee:01".into()),
+                neighbor_sysname: Some("core-sw".into()),
+                neighbor_platform: Some("cisco WS-C3750".into()),
+                protocol: "lldp".into(),
+            }],
+            1_600,
+        )
+        .unwrap();
+        let html = device_detail(&conn, "10.9.0.5");
+        // panel directly follows the Interfaces panel
+        let iface_pos = html.find("<h2>Interfaces (0)</h2>").unwrap();
+        let nbr_pos = html.find("<h2>Discovered neighbors (1)</h2>").unwrap();
+        assert!(iface_pos < nbr_pos);
+        assert!(html.contains("badge b-info\">lldp<"));
+        assert!(html.contains(">Gi0/&lt;1&gt;<"));
+        assert!(html.contains(">core-sw<"));
+        assert!(html.contains("cisco WS-C3750"));
+        assert!(html.contains("aa:bb:cc:dd:ee:01"));
+        assert!(html.contains("<th>neighbor (sysname / ip / mac)</th>"));
+
+        // blank optional fields render as "-", never raw HTML
+        db::replace_neighbors(
+            &conn,
+            id,
+            &[NeighborRow {
+                local_if_name: None,
+                neighbor_ip: Some("10.0.0.9".into()),
+                neighbor_mac: None,
+                neighbor_sysname: None,
+                neighbor_platform: Some("<script>x</script>".into()),
+                protocol: String::new(),
+            }],
+            1_700,
+        )
+        .unwrap();
+        let html = device_detail(&conn, "10.9.0.5");
+        assert!(!html.contains("<script>x</script>"));
+        assert!(html.contains("&lt;script&gt;x&lt;/script&gt;"));
+        assert!(html.contains("<td>-</td>"));
     }
 }

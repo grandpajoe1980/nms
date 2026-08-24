@@ -555,6 +555,48 @@ pub fn run(p: Params) -> Result<Model> {
                             let _ = db::replace_interfaces(&conn, dev.id, rows, now_ts);
                         }
                     }
+                    // ---- neighbor discovery (FR-DISC-004): LLDP + legacy CDP
+                    let mut nb_total = 0usize;
+                    let mut nb_hosts = 0usize;
+                    for chunk in live.chunks(32) {
+                        let collected: std::sync::Mutex<
+                            Vec<(Ipv4Addr, Vec<db::NeighborRow>)>,
+                        > = std::sync::Mutex::new(Vec::new());
+                        std::thread::scope(|s| {
+                            for &i in chunk {
+                                let ip = devices[i].ip;
+                                let collected = &collected;
+                                let community = &p.snmp_community;
+                                s.spawn(move || {
+                                    let addr = std::net::SocketAddr::new(
+                                        std::net::IpAddr::V4(ip),
+                                        161,
+                                    );
+                                    match crate::neighbors::collect(addr, community, 600) {
+                                        Ok(rows) if !rows.is_empty() => {
+                                            collected.lock().unwrap().push((ip, rows));
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                            }
+                        });
+                        for (ip, rows) in collected.into_inner().unwrap() {
+                            nb_total += rows.len();
+                            nb_hosts += 1;
+                            if let Ok(Some(dev)) =
+                                db::device_by_ip(&conn, &ip.to_string())
+                            {
+                                let _ =
+                                    db::replace_neighbors(&conn, dev.id, &rows, now_ts);
+                            }
+                        }
+                    }
+                    if nb_hosts > 0 {
+                        println!(
+                            "[*] snmp: stored {nb_total} neighbor(s) across {nb_hosts} host(s)"
+                        );
+                    }
                     drop(conn);
                     println!(
                         "[*] snmp: stored {} interface(s) across {} host(s)",

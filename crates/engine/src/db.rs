@@ -303,6 +303,19 @@ CREATE TABLE IF NOT EXISTS interfaces(
   UNIQUE(device_id, if_index)
 );
 CREATE INDEX IF NOT EXISTS idx_interfaces_device ON interfaces(device_id);
+CREATE TABLE IF NOT EXISTS neighbors(
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id       INTEGER NOT NULL REFERENCES devices(id),
+  local_if_name   TEXT,
+  neighbor_ip     TEXT,
+  neighbor_mac    TEXT,
+  neighbor_sysname TEXT,
+  neighbor_platform TEXT,
+  protocol        TEXT NOT NULL,
+  observed_ts     INTEGER NOT NULL,
+  UNIQUE(device_id, local_if_name, neighbor_mac, protocol)
+);
+CREATE INDEX IF NOT EXISTS idx_neighbors_device ON neighbors(device_id);
 "#;
 
 // ---------------------------------------------------------------- settings
@@ -699,6 +712,17 @@ pub fn mttr_secs_window(conn: &Connection, since_secs: i64) -> Option<f64> {
     .optional()
     .ok()
     .flatten()
+}
+
+pub fn mtta_secs_window(conn: &Connection, since_secs: i64) -> Result<Option<f64>> {
+    conn.query_row(
+        "SELECT AVG(ack_ts - created_ts) FROM events
+         WHERE acknowledged = 1 AND ack_ts IS NOT NULL
+           AND severity IN ('critical','warning') AND created_ts >= ?1",
+        params![since_secs],
+        |r| r.get::<_, Option<f64>>(0),
+    )
+    .map_err(Into::into)
 }
 
 // ---------------------------------------------------------------- segments
@@ -1302,6 +1326,28 @@ mod tests {
     }
 
     #[test]
+    fn mtta_secs_window_average_and_exclusions() {
+        let db = setup();
+        let c = db.lock();
+        let e1 = create_event(&c, Some(1), Some("10.0.0.5"), "device_down", "critical",
+                              "router down", None, 1_000).unwrap();
+        ack_event(&c, e1.id, true, "web", 1_060).unwrap();
+        let e2 = create_event(&c, Some(2), Some("10.0.0.6"), "high_latency", "warning",
+                              "latency spike", None, 2_000).unwrap();
+        ack_event(&c, e2.id, true, "web", 2_140).unwrap();
+        let unacked = create_event(&c, Some(3), Some("10.0.0.7"), "device_down", "critical",
+                                   "never acked", None, 1_500).unwrap();
+        assert_eq!(unacked.id, 3);
+        assert!(!event_by_id(&c, unacked.id).unwrap().unwrap().acknowledged);
+        // Only acked events count: (60 + 140) / 2 = 100; the unacked event
+        // (created 1500, no ack_ts) must not shift this.
+        let mtta = mtta_secs_window(&c, 0).unwrap().unwrap();
+        assert!((mtta - 100.0).abs() < 1e-9);
+        // Window edge: since after all created_ts -> no qualifying rows -> None.
+        assert!(mtta_secs_window(&c, 5_000).unwrap().is_none());
+    }
+
+    #[test]
     fn segments_close_and_reopen() {
         let db = setup();
         let c = db.lock();
@@ -1521,5 +1567,86 @@ mod iface_tests {
         assert_eq!(now.len(), 1);
         assert_eq!(now[0].name.as_deref(), Some("eth0"));
         assert_eq!(count_interfaces(&c), 1);
+    }
+}
+
+// --------------------------------------------------------------- neighbors
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct NeighborRow {
+    pub local_if_name: Option<String>,
+    pub neighbor_ip: Option<String>,
+    pub neighbor_mac: Option<String>,
+    pub neighbor_sysname: Option<String>,
+    pub neighbor_platform: Option<String>,
+    pub protocol: String,
+}
+
+/// Replace stored neighbor observations for one device (FR-DISC-004).
+/// Rows lacking every identifier are skipped (nothing to correlate later).
+pub fn replace_neighbors(conn: &Connection, device_id: i64, rows: &[NeighborRow], ts: i64) -> Result<()> {
+    conn.execute("DELETE FROM neighbors WHERE device_id = ?1", params![device_id])?;
+    for r in rows {
+        if r.neighbor_ip.is_none() && r.neighbor_mac.is_none() && r.neighbor_sysname.is_none() {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO neighbors(device_id, local_if_name, neighbor_ip,
+                 neighbor_mac, neighbor_sysname, neighbor_platform, protocol, observed_ts)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![device_id, r.local_if_name, r.neighbor_ip, r.neighbor_mac,
+                    r.neighbor_sysname, r.neighbor_platform, r.protocol, ts],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn list_neighbors(conn: &Connection, device_id: i64) -> Result<Vec<NeighborRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT local_if_name, neighbor_ip, neighbor_mac, neighbor_sysname,
+                neighbor_platform, protocol
+         FROM neighbors WHERE device_id = ?1 ORDER BY protocol, local_if_name",
+    )?;
+    let rows = stmt.query_map(params![device_id], |r| {
+        Ok(NeighborRow {
+            local_if_name: r.get(0)?,
+            neighbor_ip: r.get(1)?,
+            neighbor_mac: r.get(2)?,
+            neighbor_sysname: r.get(3)?,
+            neighbor_platform: r.get(4)?,
+            protocol: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+#[cfg(test)]
+mod neighbor_tests {
+    use super::*;
+
+    #[test]
+    fn neighbors_replace_skips_empty_and_lists() {
+        let db = Db::open_memory().unwrap();
+        let c = db.lock();
+        c.execute(
+            "INSERT INTO devices(ip, role, first_seen_ts, last_seen_ts) VALUES
+             ('10.0.0.9','router',1,2)", [],
+        ).unwrap();
+        let dev: i64 = c.query_row("SELECT id FROM devices WHERE ip='10.0.0.9'", [], |r| r.get(0)).unwrap();
+        let rows = vec![
+            NeighborRow {
+                local_if_name: Some("Gi0/1".into()), neighbor_ip: Some("10.0.0.2".into()),
+                neighbor_mac: None, neighbor_sysname: Some("core-sw".into()),
+                neighbor_platform: Some("cisco WS-C3750".into()), protocol: "lldp".into(),
+            },
+            NeighborRow { local_if_name: None, neighbor_ip: None, neighbor_mac: None,
+                          neighbor_sysname: None, neighbor_platform: None,
+                          protocol: "cdp".into() },
+        ];
+        replace_neighbors(&c, dev, &rows, 100).unwrap();
+        let got = list_neighbors(&c, dev).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].protocol, "lldp");
+        assert_eq!(got[0].neighbor_sysname.as_deref(), Some("core-sw"));
     }
 }

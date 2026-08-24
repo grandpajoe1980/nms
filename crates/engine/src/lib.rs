@@ -12,6 +12,7 @@ pub mod jobs;
 pub mod metrics;
 pub mod model;
 pub mod monitor;
+pub mod neighbors;
 pub mod netutil;
 pub mod ops;
 pub mod oui;
@@ -22,6 +23,7 @@ pub mod report;
 pub mod reports;
 pub mod routes;
 pub mod snmpprobe;
+pub mod snow;
 pub mod trace;
 
 /// Convenience re-exports for CLI consumers.

@@ -1,3 +1,30 @@
+## Session: overnight run - CONTINUATION 4 (2026-08-24)
+
+### ? Increment I — neighbor/topology foundations (multi-lane, 6 subagents)
+
+**Phase 0 (Lead):** `neighbors` table contract + replace/list helpers (+test).
+**Batch 1 (parallel, disjoint scopes):**
+- topology-builder ? `engine::neighbors::collect()`: LLDP-MIB + legacy CDP-MIB walks decoded to NeighborRow; 6 tests incl. mock-agent roundtrips for both protocols
+- console-builder ? "Discovered neighbors" panel on device pages (+2 tests)
+- reports-sla-builder ? `db::mtta_secs_window` Mean-Time-To-Acknowledge metric (+test)
+- integrations-builder ? `engine::snow` ServiceNow transform layer: nms.event v1 ? incident body (severity?impact/urgency matrix, correlation_id nms-{id}) + resolve patches for recovery kinds; 6 tests. HTTP delivery wiring deferred (needs instance).
+**Batch 2:** Lead wired neighbor collection into the discovery enrichment pass (persisted per device alongside interfaces).
+
+Reviewer PASS-WITH-NOTES applied: docs same-changeset (README/PRD §13 M3 marker), multi-lane commit citation.
+Battery: **80 tests passing** workspace-wide; clippy clean; release built; instance restarted.
+
+| Lane | Agent | Status |
+|---|---|---|
+| neighbors collect | topology-builder | ? |
+| neighbors UI | console-builder | ? |
+| MTTA | reports-sla-builder | ? |
+| SNOW transform | integrations-builder | ? (delivery pending instance) |
+| GETBULK | snmp-collector-builder | ? deferred to next pass |
+| discovery wiring | Lead | ? |
+
+**Next up:** GETBULK protocol op · SSH config backup drivers · capacity forecast v0.
+
+---
 # PROGRESS â€” autonomous build checkpoint file
 
 Updated at the end of every increment. Newest entry first.
