@@ -22,6 +22,7 @@ pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("webhook_url", ""),
     ("webhook_enabled", "0"),
     ("site_auto_prefix", "24"),
+    ("sla_target_pct", "99.5"),
 ];
 
 pub struct Db {

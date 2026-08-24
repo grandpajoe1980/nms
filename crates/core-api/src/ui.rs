@@ -841,6 +841,9 @@ pub fn reports_page(conn: &Connection, hours: i64) -> String {
     let rows = availability_rows(conn, hours);
     let mttr = db::mttr_secs_window(conn, chrono::Utc::now().timestamp() - hours * 3600);
     let mttr_s = mttr.map(|v| format!("{v:.0}s")).unwrap_or_else(|| "-".into());
+    let target: f64 = db::get_setting_or(conn, "sla_target_pct", "99.5")
+        .parse()
+        .unwrap_or(99.5);
     let mut body = String::new();
     let _ = write!(body,
         "<div style=\"display:flex;gap:8px;margin-bottom:10px;align-items:center\">\
@@ -848,14 +851,23 @@ pub fn reports_page(conn: &Connection, hours: i64) -> String {
 <a class=\"badge b-info\" href=\"/reports?hours=168\">7d</a>\
 <a class=\"badge b-info\" href=\"/reports?hours=720\">30d</a>\
 <span class=\"muted\">MTTR over window: <b>{mttr_s}</b></span>\
+<span class=\"muted\">SLA target: <b>{target:.2}%</b> (set sla_target_pct in Settings)</span>\
 <a style=\"margin-left:auto\" href=\"/api/report/availability.csv?hours={hours}\">download site csv</a></div>\
-<table><tr><th>site</th><th>devices</th><th>probes</th><th>uptime</th><th>avg rtt</th><th>per-device csv</th></tr>");
+<table><tr><th>site</th><th>devices</th><th>probes</th><th>uptime</th><th>SLA</th><th>avg rtt</th><th>per-device csv</th></tr>");
     for (site, devs, probes, ups, pct, rtt) in &rows {
         let bar = pct_bar(*pct);
         let enc = urlencode(site);
+        let sla = if *pct >= target {
+            "<span style=\"color:var(--up)\">met</span>".to_string()
+        } else {
+            format!(
+                "<span style=\"color:var(--down)\">missed by {:.2}%</span>",
+                target - pct
+            )
+        };
         let _ = write!(body,
             "<tr><td>{}</td><td>{devs}</td><td class=\"mono\">{probes} / {ups}</td><td>{bar}</td>\
-<td class=\"mono\">{rtt:.1} ms</td><td><a href=\"/api/report/devices.csv?hours={hours}&site={enc}\">csv</a></td></tr>",
+<td>{sla}</td><td class=\"mono\">{rtt:.1} ms</td><td><a href=\"/api/report/devices.csv?hours={hours}&site={enc}\">csv</a></td></tr>",
             esc(site));
     }
     body.push_str("</table>");

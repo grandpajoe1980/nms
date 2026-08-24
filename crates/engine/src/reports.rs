@@ -69,9 +69,20 @@ pub fn devices_csv(conn: &Connection, hours: i64, site: Option<&str>) -> String 
 }
 
 pub fn availability_csv(conn: &Connection, hours: i64) -> String {
-    let mut out = String::from("site,devices,probes,ups,uptime_pct,avg_rtt_ms\n");
+    let target = conn
+        .query_row("SELECT value FROM meta WHERE key='sla_target_pct'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(99.5);
+    let mut out = String::from("site,devices,probes,ups,uptime_pct,target_pct,sla_status,avg_rtt_ms\n");
     for (site, devs, probes, ups, pct, rtt) in availability_rows(conn, hours) {
-        let _ = writeln!(out, "{site},{devs},{probes},{ups},{pct:.3},{rtt:.2}");
+        let status = if pct >= target { "met" } else { "missed" };
+        let _ = writeln!(
+            out,
+            "{site},{devs},{probes},{ups},{pct:.3},{target:.2},{status},{rtt:.2}"
+        );
     }
     out
 }
