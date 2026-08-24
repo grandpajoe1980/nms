@@ -24,6 +24,8 @@ pub struct Params {
     pub no_auto: bool,
     pub scan: ScanParams,
     pub out_dir: PathBuf,
+    /// max TTL-walk paths probed during classification (0 disables)
+    pub walk_budget: usize,
 }
 
 struct Acc {
@@ -150,7 +152,7 @@ pub fn run(p: Params) -> Result<Model> {
         println!("[*] oversized subnets (>{} hosts) are sampled; use --full for complete sweeps", p.big_threshold);
     }
 
-    let prog = Progress::start(all_targets.len());
+    let prog = Progress::start("discover", all_targets.len());
     let outcomes = sweep(&all_targets, &p.scan, Some(deadline), Some(&prog.done))?;
     prog.finish();
 
@@ -242,7 +244,7 @@ pub fn run(p: Params) -> Result<Model> {
             .collect();
         let picks = candidates.into_iter().choose_multiple(&mut rand::thread_rng(), 3);
         for c in picks {
-            if walked >= 150 || Instant::now() >= deadline {
+            if walked >= p.walk_budget || Instant::now() >= deadline {
                 break 'outer;
             }
             walked += 1;

@@ -98,7 +98,7 @@ pub fn sweep_once(p: &Params) -> Result<RunResult> {
     let mut targets: Vec<Target> = target_set.into_iter().map(Target::new).collect();
     netutil::shuffle(&mut targets);
 
-    let prog = Progress::start(targets.len());
+    let prog = Progress::start("check", targets.len());
     let mut outcomes = sweep(&targets, &p.scan, Some(deadline), Some(&prog.done))?;
     prog.finish();
 

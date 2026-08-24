@@ -10,6 +10,7 @@ mod netutil;
 mod ops;
 mod oui;
 mod ping;
+mod progress;
 mod report;
 mod routes;
 mod server;
@@ -53,6 +54,8 @@ enum Cmd {
         sample: u32,
         #[arg(long, help = "sweep every subnet completely (ignores 1h budget safety)")]
         full: bool,
+        #[arg(long, default_value_t = 150, help = "max TTL-walk paths for router discovery (0 disables)")]
+        walks: usize,
         #[arg(long, help = "do not auto-seed from local interfaces/routes")]
         no_auto: bool,
         #[arg(long, default_value = "output", help = "output directory")]
@@ -190,6 +193,7 @@ fn main() -> Result<()> {
             big_threshold,
             sample,
             full,
+            walks,
             no_auto,
             out,
         } => {
@@ -210,6 +214,7 @@ fn main() -> Result<()> {
                     payload_len: 32,
                 },
                 out_dir: out.clone(),
+                walk_budget: walks,
             })?;
             let store = db::Db::open(&out.join("ops.db"))?;
             {

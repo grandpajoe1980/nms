@@ -252,6 +252,7 @@ fn route(method: &str, path: &str, query: &str, body: &str, shared: &Arc<Shared>
                     "monitoring": shared.monitoring.load(Ordering::Relaxed),
                     "message": shared.message.lock().unwrap().clone(),
                     "revision": shared.revision.load(Ordering::Relaxed),
+                    "progress": crate::progress::snapshot(),
                     "events": shared.events.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
                     "ops": stats,
                 }),
@@ -485,6 +486,9 @@ fn start_job(shared: &Arc<Shared>, p: &Params, kind: Job) -> Vec<u8> {
         }
         *current = kind;
     }
+    if kind == Job::Discover && shared.monitoring.swap(false, Ordering::Relaxed) {
+        set_message(shared, "monitor paused for discovery");
+    }
     set_message(shared, "queued");
     let sh = shared.clone();
     let pp = p.clone();
@@ -501,10 +505,11 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
             full: false,
             big_threshold: 4096,
             sample: 2048,
-            budget: Duration::from_secs(45 * 60),
+            budget: Duration::from_secs(10 * 60),
             no_auto: false,
-            scan: ScanParams { rate_pps: 600.0, concurrency: 512, timeout_ms: 800, payload_len: 32 },
+            scan: ScanParams { rate_pps: 2000.0, concurrency: 512, timeout_ms: 500, payload_len: 32 },
             out_dir: p.out_dir.clone(),
+            walk_budget: 24,
         })
         .map(|m| {
             if let Ok(ids) = crate::ops::sync_model(

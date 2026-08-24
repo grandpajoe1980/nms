@@ -57,7 +57,8 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub fn start(total: usize) -> Self {
+    pub fn start(label: &'static str, total: usize) -> Self {
+        crate::progress::begin(label, total);
         let done = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let done_t = done.clone();
@@ -79,6 +80,7 @@ impl Progress {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        crate::progress::clear();
         eprintln!();
     }
 }
@@ -157,6 +159,7 @@ pub fn sweep(
                         if let Some(pr) = progress {
                             pr.fetch_add(1, Ordering::Relaxed);
                         }
+                        crate::progress::tick(1);
                     }
                 });
         }

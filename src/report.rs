@@ -543,11 +543,12 @@ body.noside #side { display:none; }
   <span style="color:var(--dim)" id="viscount"></span>
   <span style="flex:1"></span>
   <span class="pill" id="jobpill">idle</span>
+  <div id="jobwrap" title="job progress" style="display:none;width:140px;height:6px;border-radius:3px;background:#1b2745;overflow:hidden"><div id="jobbar" style="height:100%;width:0%;background:var(--up)"></div></div>
   <a href="/console"><button title="dashboards, events, reports, settings">Console</button></a>
   <button id="btn-start" title="discover the network, then start continuous monitoring">Start NMS</button>
   <a id="lnk-routes" href="/api/routes" target="_blank"><button>Routes</button></a>
   <a id="lnk-ifaces" href="/api/ifaces" target="_blank"><button>Ifaces</button></a>
-  <button id="btn-ping" title="single-ping an IPv4 address">Ping</button>
+  <button id="btn-ping" title="ping the selected device (or enter an address)">Ping</button>
   <button id="btn-discover" title="full crawl: subnets, devices, roles, map rebuild">Discover</button>
   <button id="btn-check" title="fast up/down sweep of everything in the model">Check now</button>
   <button id="btn-monitor" title="toggle continuous monitoring with down-alerts">Monitor</button>
@@ -917,10 +918,21 @@ async function post(p) {
   return r.text();
 }
 function setBusy(b) { btnD.disabled = b; btnC.disabled = b; btnStart.disabled = b; }
+const jobwrap = document.getElementById("jobwrap");
+const jobbar = document.getElementById("jobbar");
 async function poll() {
   try {
     const s = await (await fetch("/api/status")).json();
-    pill.textContent = s.job !== "idle" ? s.job + "..." : (s.monitoring ? "monitoring" : "idle");
+    const p = s.progress;
+    if (p && p.total > 0) {
+      const pct = Math.min(100, Math.round(100 * p.done / p.total));
+      pill.textContent = p.label + " " + pct + "%";
+      jobwrap.style.display = "inline-block";
+      jobbar.style.width = pct + "%";
+    } else {
+      pill.textContent = s.job !== "idle" ? s.job + "..." : (s.monitoring ? "monitoring" : "idle");
+      jobwrap.style.display = "none";
+    }
     pill.title = s.message || "";
     btnM.textContent = s.monitoring ? "Stop monitor" : "Monitor";
     renderEvents(s.events);
@@ -962,7 +974,12 @@ if (SERVED) {
     setTimeout(poll, 400);
   };
   btnPing.onclick = async () => {
-    const ip = prompt("IPv4 address to ping:");
+    let ip = null;
+    if (selected) {
+      const n = DATA.nodes.find(n => n.id === selected);
+      if (n && n.ip) ip = n.ip;
+    }
+    if (!ip) ip = prompt("IPv4 address to ping:");
     if (!ip) return;
     try {
       const r = await fetch("/api/ping?ip=" + encodeURIComponent(ip), { method: "POST" });
