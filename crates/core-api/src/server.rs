@@ -360,6 +360,7 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
             "200 OK",
             engine::metrics::render(&shared.store.lock()),
         ),
+        ("GET", "/api/search") => search_endpoint(query, shared),
         ("GET", "/login") => login_page(None),
         ("POST", "/login") => {
             let username = form_value(body, "username").unwrap_or_default();
@@ -747,6 +748,52 @@ fn trace_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
     json("200 OK", serde_json::json!({"ip": ip.to_string(), "hops": enriched}))
 }
 
+fn search_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
+    let Some(q) = query_param(query, "q").map(|v| url_decode(&v)).filter(|v| v.len() >= 2) else {
+        return json("200 OK", serde_json::json!({"devices": [], "sites": []}));
+    };
+    let like = format!("%{q}%");
+    let conn = shared.store.lock();
+
+    let devices: Vec<serde_json::Value> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT ip, role, COALESCE(hostname,''), COALESCE(device_class,''),
+                    (SELECT name FROM sites WHERE id=site_id)
+             FROM devices
+             WHERE ip LIKE ?1 OR COALESCE(hostname,'') LIKE ?1 OR COALESCE(mac,'') LIKE ?1
+                OR COALESCE(device_class,'') LIKE ?1
+             ORDER BY ip LIMIT 20",
+        ) else {
+            return json("500 Internal Server Error", serde_json::json!({"error":"query failed"}));
+        };
+        stmt.query_map(rusqlite::params![like], |r| {
+            Ok(serde_json::json!({
+                "ip": r.get::<_, String>(0)?,
+                "role": r.get::<_, String>(1)?,
+                "hostname": r.get::<_, String>(2)?,
+                "class": r.get::<_, String>(3)?,
+                "site": r.get::<_, Option<String>>(4)?
+            }))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    };
+
+    let sites: Vec<String> = {
+        let Ok(mut stmt) =
+            conn.prepare("SELECT name FROM sites WHERE name LIKE ?1 ORDER BY name LIMIT 10")
+        else {
+            return json("500 Internal Server Error", serde_json::json!({"error":"query failed"}));
+        };
+        stmt.query_map(rusqlite::params![like], |r| r.get::<_, String>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    };
+
+    db::audit(&conn, "web", "search.query", &q, "");
+    json("200 OK", serde_json::json!({ "devices": devices, "sites": sites }))
+}
+
 fn health_endpoint(shared: &Arc<Shared>) -> Vec<u8> {
     // Database probe: time a trivial query. Never hold the lock longer than
     // this check; a poisoned/hung DB surfaces as degraded, not a hung request.
@@ -809,6 +856,7 @@ pub const API_ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/api/health", "Component health: database, scheduler, webhook queue"),
     ("GET", "/api/openapi.json", "This OpenAPI 3.0 document"),
     ("GET", "/metrics", "Prometheus text-format exposition of platform gauges"),
+    ("GET", "/api/search", "Global search across devices and sites"),
     ("GET", "/api/model", "Current discovered topology model.json"),
     ("GET", "/api/dashboard.json", "Dashboard aggregates: counts, trend, worst latency, event counters"),
     ("GET", "/api/device/{ip}.json", "One inventory device record"),

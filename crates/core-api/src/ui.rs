@@ -63,7 +63,11 @@ pub fn page(conn: &Connection, title: &str, active: &str, body: &str) -> String 
         "<!doctype html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <title>{title} \u{b7} NMS</title><style>{CSS}</style></head><body>\
-<div class=\"topbar\"><b>NMS</b>{nav}<span style=\"margin-left:auto\" class=\"muted\">\
+<div class=\"topbar\"><b>NMS</b>{nav}\
+<form method=\"get\" action=\"/devices\" style=\"margin-left:auto;display:flex;gap:6px\">\
+<input name=\"q\" placeholder=\"search ip/mac/host\u{2026}\" size=\"22\">\
+<button type=\"submit\">go</button></form>\
+<span class=\"muted\">\
 alerts <span style=\"color:var(--down)\">{open}</span> open / {unacked} unacked</span></div>\
 <div class=\"wrap\">{body}</div></body></html>");
     out
