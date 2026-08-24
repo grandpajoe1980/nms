@@ -1,5 +1,6 @@
 use crate::db::{self, Db};
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,4 +96,62 @@ pub fn start_webhook_sender(dbh: Arc<Db>) {
             }
         })
         .expect("spawn webhook sender");
+}
+
+/// Hourly scheduled reporting: rolling 24h availability snapshot plus a
+/// once-per-day dated CSV (StableNet-style report generation).
+pub fn start_report_writer(dbh: Arc<Db>, out_dir: PathBuf) {
+    std::thread::Builder::new()
+        .name("report-writer".into())
+        .spawn(move || {
+            let reports_dir = out_dir.join("reports");
+            let mut last_day = String::new();
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+                if std::fs::create_dir_all(&reports_dir).is_err() {
+                    continue;
+                }
+                let conn = dbh.lock();
+                let csv = crate::ui::availability_csv(&conn, 24);
+                drop(conn);
+                let _ = std::fs::write(reports_dir.join("latest-24h.csv"), &csv);
+                let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                if day != last_day {
+                    let path = reports_dir.join(format!("daily-{day}.csv"));
+                    if !path.exists() {
+                        let _ = std::fs::write(&path, &csv);
+                        println!("[jobs] wrote {}", path.display());
+                    }
+                    last_day = day.clone();
+                    // prune snapshots older than 90 days
+                    if let Ok(entries) = std::fs::read_dir(&reports_dir) {
+                        let cutoff = chrono::Utc::now() - chrono::Duration::days(90);
+                        for e in entries.flatten() {
+                            let name_ok = e
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with("daily-");
+                            if !name_ok {
+                                continue;
+                            }
+                            let stale = e.metadata().ok()
+                                .and_then(|m| m.modified().ok())
+                                .map(|t| t.elapsed().map(|d| d.as_secs()).unwrap_or(0))
+                                .unwrap_or(0)
+                                > 90 * 86_400;
+                            let date_stale = chrono::NaiveDate::parse_from_str(
+                                e.file_name().to_string_lossy().trim_start_matches("daily-").trim_end_matches(".csv"),
+                                "%Y-%m-%d",
+                            )
+                            .map(|d| d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc().timestamp() < cutoff.timestamp()).unwrap_or(false))
+                            .unwrap_or(false);
+                            if stale || date_stale {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .expect("spawn report writer");
 }

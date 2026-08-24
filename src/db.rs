@@ -18,6 +18,7 @@ pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("raw_retention_hours", "36"),
     ("hourly_retention_days", "14"),
     ("daily_retention_days", "400"),
+    ("absent_retire_days", "30"),
     ("webhook_url", ""),
     ("webhook_enabled", "0"),
     ("site_auto_prefix", "24"),
@@ -975,6 +976,45 @@ pub fn purge_sent_outbound(conn: &Connection, older_than_secs: i64) -> Result<us
         params![older_than_secs],
     )
     .map_err(Into::into)
+}
+
+// ------------------------------------------------------- device lifecycle
+
+/// Remove a device and its probe history from the inventory.
+/// Events are kept (they carry the IP as text) for audit continuity.
+pub fn remove_device(conn: &Connection, id: i64) -> Result<bool> {
+    conn.execute("DELETE FROM samples WHERE device_id = ?1", params![id])?;
+    conn.execute("DELETE FROM segments WHERE device_id = ?1", params![id])?;
+    conn.execute("DELETE FROM rollup_hourly WHERE device_id = ?1", params![id])?;
+    conn.execute("DELETE FROM rollup_daily WHERE device_id = ?1", params![id])?;
+    conn.execute("DELETE FROM device_diag WHERE device_id = ?1", params![id])?;
+    let n = conn.execute("DELETE FROM devices WHERE id = ?1", params![id])?;
+    Ok(n > 0)
+}
+
+/// Drop inventory entries that have not been seen for a long time so that
+/// decommissioned hardware eventually disappears instead of lingering "down".
+/// Manually sited or explicitly unmanaged devices are preserved.
+pub fn retire_absent_devices(conn: &Connection, cutoff_ts: i64) -> Result<usize> {
+    let stale: Vec<i64> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id FROM devices
+             WHERE last_seen_ts < ?1 AND managed = 1
+               AND COALESCE(site_source,'auto') != 'manual'",
+        ) else {
+            return Ok(0);
+        };
+        stmt.query_map(params![cutoff_ts], |r| r.get(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    };
+    let mut n = 0;
+    for id in stale {
+        if remove_device(conn, id)? {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 pub fn epoch_day(ts: i64) -> i64 {

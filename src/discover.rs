@@ -28,6 +28,8 @@ pub struct Params {
     pub walk_budget: usize,
     /// profile live endpoints: reverse-DNS names, TCP port fingerprint, class
     pub deep: bool,
+    /// drop previously-seen devices unseen longer than this many days
+    pub retire_days: u64,
 }
 
 struct Acc {
@@ -346,7 +348,14 @@ pub fn run(p: Params) -> Result<Model> {
     }
 
     if let Some(pm) = prior {
+        let retire_cutoff = Utc::now() - chrono::Duration::days(p.retire_days.max(1) as i64);
         for d in pm.devices {
+            // Retire devices that have been absent far too long.
+            if let Ok(seen) = chrono::DateTime::parse_from_rfc3339(&d.last_seen) {
+                if seen.with_timezone(&Utc) < retire_cutoff && d.wap.is_none() {
+                    continue;
+                }
+            }
             match devices.iter_mut().find(|x| x.ip == d.ip) {
                 Some(nd) => {
                     nd.first_seen = d.first_seen;

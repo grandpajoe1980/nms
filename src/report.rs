@@ -892,22 +892,24 @@ for (const id of ["f-router","f-wap","f-endpoint","f-agg"]) {
 document.getElementById("f-state").onchange = computeVisible;
 document.getElementById("search").oninput = computeVisible;
 
-DATA.nodeIdx = {};
-for (const n of DATA.nodes) DATA.nodeIdx[n.id] = n;
-
-document.getElementById("s-up").textContent = DATA.counts.up;
-document.getElementById("s-down").textContent = DATA.counts.down;
-document.getElementById("s-rt").textContent = DATA.counts.routers;
-document.getElementById("s-wap").textContent = DATA.counts.waps;
-document.getElementById("s-ep").textContent = DATA.counts.endpoints;
-document.getElementById("s-sub").textContent = DATA.counts.subnets;
-document.getElementById("s-hosts").textContent = DATA.counts.hosts.toLocaleString();
-
-buildGrid();
-resize();
+function applyData(d) {
+  DATA = d;
+  DATA.nodeIdx = {};
+  for (const n of DATA.nodes) DATA.nodeIdx[n.id] = n;
+  document.getElementById("s-up").textContent = DATA.counts.up;
+  document.getElementById("s-down").textContent = DATA.counts.down;
+  document.getElementById("s-rt").textContent = DATA.counts.routers;
+  document.getElementById("s-wap").textContent = DATA.counts.waps;
+  document.getElementById("s-ep").textContent = DATA.counts.endpoints;
+  document.getElementById("s-sub").textContent = DATA.counts.subnets;
+  document.getElementById("s-hosts").textContent = DATA.counts.hosts.toLocaleString();
+  buildGrid();
+  resize();
+  computeVisible();
+  fit();
+}
+applyData(DATA);
 window.addEventListener("resize", () => { resize(); fit(); });
-computeVisible();
-fit();
 
 const SERVED = location.protocol === "http:" || location.protocol === "https:";
 const btnD = document.getElementById("btn-discover");
@@ -919,6 +921,7 @@ const pill = document.getElementById("jobpill");
 let lastJob = null;
 let lastRevision = null;
 let monitorAfterJob = false;
+let refreshing = false;
 
 async function post(p) {
   const r = await fetch(p, { method: "POST" });
@@ -929,35 +932,43 @@ function setBusy(b) { btnD.disabled = b; btnC.disabled = b; btnStart.disabled = 
 const jobwrap = document.getElementById("jobwrap");
 const jobbar = document.getElementById("jobbar");
 async function poll() {
+  if (refreshing) return;
   try {
     const s = await (await fetch("/api/status")).json();
     const p = s.progress;
+    const busy = s.job !== "idle";
     if (p && p.total > 0) {
       const pct = Math.min(100, Math.round(100 * p.done / p.total));
       pill.textContent = p.label + " " + pct + "%";
-      jobwrap.style.display = "inline-block";
-      jobbar.style.width = pct + "%";
+      if (jobwrap) jobwrap.style.display = "inline-block";
+      if (jobbar) jobbar.style.width = pct + "%";
     } else {
-      pill.textContent = s.job !== "idle" ? s.job + "..." : (s.monitoring ? "monitoring" : "idle");
-      jobwrap.style.display = "none";
+      pill.textContent = busy ? s.job + "..." : (s.monitoring ? "monitoring" : "idle");
+      if (jobwrap) jobwrap.style.display = "none";
     }
     pill.title = s.message || "";
     btnM.textContent = s.monitoring ? "Stop monitor" : "Monitor";
     renderEvents(s.events);
-    setBusy(s.job !== "idle");
-    if (lastJob && lastJob !== "idle" && s.job === "idle") {
-      if (monitorAfterJob && !s.monitoring) {
+    setBusy(busy);
+    const jobJustFinished = lastJob && lastJob !== "idle" && !busy;
+    const revisionChanged = lastRevision !== null && s.revision !== lastRevision && !busy;
+    lastJob = s.job;
+    lastRevision = s.revision;
+    if (jobJustFinished || revisionChanged) {
+      if (jobJustFinished && monitorAfterJob && !s.monitoring) {
         monitorAfterJob = false;
         try { await post("/api/monitor/start"); } catch (e) { alert(e.message); }
       }
-      location.reload(); return;
+      // Refresh the map in place — never reload the page (it kills clicks).
+      refreshing = true;
+      try {
+        const d = await (await fetch("/api/model")).json();
+        applyData(d);
+      } catch (e) {} finally { refreshing = false; }
     }
-    if (lastRevision !== null && s.revision !== lastRevision && s.job === "idle") {
-      location.reload(); return;
-    }
-    lastJob = s.job;
-    lastRevision = s.revision;
-  } catch (e) {}
+  } catch (e) {
+    setBusy(false);
+  }
 }
 if (SERVED) {
   btnStart.onclick = async () => {

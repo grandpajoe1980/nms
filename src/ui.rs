@@ -389,6 +389,7 @@ pub fn device_detail(conn: &Connection, ip: &str) -> String {
     // actions
     let (mbtn, mval) = if maint_active { ("stop maintenance", "off") } else { ("maintenance 60 min", "60") };
     let (mgbtn, mgval) = if d.managed { ("mark unmanaged", "0") } else { ("mark managed", "1") };
+    let ip_js = esc(ip);
     let _ = write!(body,
         "<div class=\"panel\" style=\"margin:10px 0\"><h2>Actions</h2>\
 <form class=\"inline\" method=\"post\" action=\"/api/device\">\
@@ -400,15 +401,18 @@ pub fn device_detail(conn: &Connection, ip: &str) -> String {
 <button>assign site</button></form> &nbsp;\
 <form class=\"inline\" method=\"post\" action=\"/api/device\">\
 <input type=\"hidden\" name=\"ip\" value=\"{ip}\"><input type=\"hidden\" name=\"action\" value=\"managed\">\
-<input type=\"hidden\" name=\"value\" value=\"{mgval}\"><button>{mgbtn}</button></form></div>");
+<input type=\"hidden\" name=\"value\" value=\"{mgval}\"><button>{mgbtn}</button></form> &nbsp;\
+<form class=\"inline\" method=\"post\" action=\"/api/device\" onsubmit=\"return confirm('Remove {ip_js} from inventory and map? History events are kept.')\">\
+<input type=\"hidden\" name=\"ip\" value=\"{ip}\"><input type=\"hidden\" name=\"action\" value=\"remove\">\
+<button style=\"color:var(--down)\">remove from inventory</button></form></div>");
 
-    let ip_js = esc(ip);
     let _ = write!(body,
-        "<div class=\"panel\" style=\"margin:10px 0\"><h2>Diagnostics &amp; WAP inference</h2>\
+        "<div class=\"panel\" style=\"margin:10px 0\"><h2>Diagnostics</h2>\
 <button onclick=\"runDiag('{ip_js}')\">Run diagnostics</button> &nbsp;\
-<button onclick=\"suggestWap('{ip_js}')\">Suggest WAP</button> &nbsp;\
+<button onclick=\"tracePath('{ip_js}')\">Trace path</button> &nbsp;\
+<button onclick=\"pingOne()\">Quick ping</button> &nbsp;\
 <span id=\"pingone\" class=\"muted\"></span>\
-<div id=\"diagout\" class=\"muted\" style=\"margin-top:8px\">burst pings measure loss / jitter / percentiles — ICMP responsiveness, not Mbps bandwidth.</div></div>\
+<div id=\"diagout\" class=\"muted\" style=\"margin-top:8px\">burst pings measure loss / jitter / percentiles \u{2014} ICMP responsiveness, not Mbps bandwidth.</div></div>\
 <script>
 const escHtml = s => {{ const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }};
 const fmt1 = v => v == null ? '-' : Number(v).toFixed(1);
@@ -421,34 +425,33 @@ async function runDiag(ip) {{
     if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
     const g = d.diag;
     const svcs = (d.services || []).map(s => s.port + '(' + s.service + ')').join(', ');
+    const miss = (d.expected_missing || []);
     el.innerHTML = '<b>score ' + g.score + '/100 (' + g.verdict + ')</b> · loss ' +
       g.loss_pct.toFixed(0) + '% · avg ' + fmt1(g.rtt_avg) + 'ms · min/max ' +
       fmt1(g.rtt_min) + '/' + fmt1(g.rtt_max) + 'ms · p95 ' + fmt1(g.rtt_p95) +
       'ms · jitter ' + fmt1(g.jitter_ms) + 'ms<br>class: <b>' + escHtml(d.device_class) +
       '</b>' + (d.hostname ? ' · host ' + escHtml(d.hostname) : '') +
-      (svcs ? ' · open ports ' + escHtml(svcs) : '');
+      (svcs ? ' · open ports ' + escHtml(svcs) : '') +
+      (miss.length ? '<br><span style=\\'color:var(--down)\\'>missing expected services: ' +
+        escHtml(miss.join(', ')) + '</span>' : '');
   }} catch (e) {{ el.textContent = 'diagnostics failed: ' + e.message; }}
 }}
-async function suggestWap(ip) {{
+async function tracePath(ip) {{
   const el = document.getElementById('diagout');
-  el.textContent = 'correlating latency with candidate WAPs…';
+  el.textContent = 'tracing path…';
   try {{
-    const r = await fetch('/api/suggest_wap?ip=' + encodeURIComponent(ip), {{ method: 'POST' }});
+    const r = await fetch('/api/trace?ip=' + encodeURIComponent(ip), {{ method: 'POST' }});
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-    if (!d.wap) {{ el.textContent = d.note || 'no confident suggestion'; return; }}
-    const pct = Math.round(Math.abs(d.correlation) * 100);
-    el.innerHTML = 'suggested WAP <b>' + escHtml(d.wap) + '</b> (latency correlation ' +
-      pct + '% over ' + d.pairs + ' paired probes) ';
-    const btn = document.createElement('button');
-    btn.textContent = 'apply';
-    btn.onclick = () => applyWap(ip, d.wap);
-    el.appendChild(btn);
-  }} catch (e) {{ el.textContent = 'suggestion failed: ' + e.message; }}
-}}
-async function applyWap(ip, wap) {{
-  const r = await fetch('/api/associate?device=' + ip + '&wap=' + wap, {{ method: 'POST' }});
-  if (r.ok) location.reload();
+    let html = '<table><tr><th>hop</th><th>address</th><th>role</th><th>site</th><th>rtt</th></tr>';
+    for (const h of d.hops) {{
+      html += '<tr><td>' + h.ttl + '</td><td class=\\'mono\\'>' +
+        (h.reached ? '<b>' : '') + escHtml(h.ip || '*') + (h.reached ? '</b> (target)' : '') +
+        '</td><td>' + escHtml(h.role || '-') + '</td><td>' + escHtml(h.site || '-') +
+        '</td><td>' + fmt1(h.rtt_ms) + ' ms</td></tr>';
+    }}
+    el.innerHTML = html + '</table>';
+  }} catch (e) {{ el.textContent = 'trace failed: ' + e.message; }}
 }}
 async function pingOne() {{
   try {{
@@ -460,6 +463,24 @@ async function pingOne() {{
 }}
 pingOne();
 </script>");
+
+    // dependency impact: what sits behind this device
+    let children: Vec<String> = conn
+        .prepare("SELECT ip FROM devices WHERE parent_id = ?1 ORDER BY ip LIMIT 500")
+        .and_then(|mut s| {
+            s.query_map(rusqlite::params![d.id], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+    if !children.is_empty() {
+        let mut list = String::new();
+        for c in &children {
+            let _ = write!(list, "<a href=\"/device/{c}\">{c}</a> ");
+        }
+        let _ = write!(body,
+            "<div class=\"panel\" style=\"margin:10px 0\"><h2>Depends on this device ({})</h2>{list}</div>",
+            children.len());
+    }
 
     let chart = svg_line(&spark, 600, 120, "var(--info)", "ms");
     let timeline = svg_timeline(&segs, now - 86_400, now);
@@ -528,23 +549,22 @@ fn svg_timeline(segs: &[db::Segment], start: i64, end: i64) -> String {
 pub fn events_page(conn: &Connection, only_open: bool, severity: Option<&str>) -> String {
     let evs = db::list_events(conn, only_open, severity, None, 0, 200).unwrap_or_default();
     let sev_sel = severity.unwrap_or("");
-    let mut body = String::from(
+    let view_sel = if only_open { "open" } else { "all" };
+    let mut body = format!(
         "<form method=\"get\" action=\"/events\" style=\"display:flex;gap:8px;margin-bottom:10px\">\
-<select name=\"view\"><option value=\"all\">all</option><option value=\"open\">open only</option></select>\
+<select name=\"view\"><option value=\"all\"{}>all</option><option value=\"open\"{}>open only</option></select>\
 <select name=\"severity\"><option value=\"\">any severity</option>",
+        if view_sel == "all" { " selected" } else { "" },
+        if view_sel == "open" { " selected" } else { "" }
     );
     for s in ["critical", "warning", "info"] {
         let sel = if sev_sel == s { " selected" } else { "" };
         let _ = write!(body, "<option value=\"{s}\"{sel}>{s}</option>");
     }
-    let view_sel = if only_open { "open" } else { "all" };
     let _ = write!(body,
-        "</select><input type=\"hidden\" name=\"viewset\" value=\"1\">\
-<script>document.currentScript;</script>\
-<button>filter</button></form>\
+        "</select><button>filter</button></form>\
 <table><tr><th>time</th><th>sev</th><th>kind</th><th>device</th><th>message</th>\
 <th>state</th><th>ack</th><th></th></tr>");
-    let _ = view_sel;
     for e in &evs {
         let ack_btn = if e.state == "open" {
             let next = if e.acknowledged { "0" } else { "1" };

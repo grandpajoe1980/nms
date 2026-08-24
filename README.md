@@ -26,8 +26,12 @@ performance, configuration management):
 | **deep endpoint profiling** | `discover --deep` (default from the web panel) reverse-DNS names, light TCP port fingerprinting (14 common ports), OUI vendor hints → device class: printer / NAS / server / computer / mobile / IoT / TV / appliance |
 | fault management | continuous sweeps; up/down/unreachable states; **dependency-aware root-cause suppression** (a downed router collapses all its endpoints into one incident with an impacted-device count); flapping detection & damping; maintenance windows; acknowledge workflow |
 | performance management | RTT samples + hourly/daily rollups; latency warning/critical thresholds; rolling loss detection ("degraded"); jitter accounting |
-| diagnostics | per-device burst ping: loss %, min/avg/max/p95 RTT, jitter, link-quality score 0-100 (ICMP responsiveness — not Mbps bandwidth); port/service list; live on the device page |
-| wap association | manual binding stays authoritative; latency-correlation *suggestions* (endpoint vs candidate WAP RTT pairing) with one-click apply once enough samples exist |
+| diagnostics | per-device burst ping: loss %, min/avg/max/p95 RTT, jitter, link-quality score 0-100 (ICMP responsiveness — not Mbps bandwidth); port/service list with **expected-service checks** per device class |
+| wap association | manual endpoint→WAP binding from the map or device page; ICMP/ARP cannot infer radio association, so nothing is guessed automatically |
+| path analysis | on-demand ICMP traceroute per device with inventory-enriched hops (role/site/class) |
+| impact analysis | "depends on this device" listing straight on the device page |
+| inventory hygiene | devices unseen for `absent_retire_days` (default 30) are retired automatically; explicit remove button keeps the map clean today |
+| scheduled reporting | hourly 24h-availability snapshot + dated daily CSVs under `output/reports/` (90-day retention) |
 | configuration management | roadmap (SSH/SNMP config backup) — not yet implemented |
 | reporting | per-site availability % (24h/7d/30d), MTTR, avg RTT; HTML tables + CSV exports (site-level and per-device) |
 | audit | every user action (settings change, ack, site assign, maintenance toggle, webhook test) recorded with actor/time/details |

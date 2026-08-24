@@ -198,6 +198,26 @@ pub fn classify(
     "unknown".into()
 }
 
+/// Ports a device class should be serving; deviations surface as
+/// "missing services" in diagnostics (functional health beyond reachability).
+pub fn expected_services(class: &str) -> &'static [u16] {
+    match class {
+        "printer" => &[631, 9100],
+        "nas" => &[445],
+        "server" => &[22],
+        "computer" => &[445],
+        _ => &[],
+    }
+}
+
+pub fn missing_expected(class: &str, open: &[u16]) -> Vec<u16> {
+    expected_services(class)
+        .iter()
+        .filter(|p| !open.contains(p))
+        .copied()
+        .collect()
+}
+
 /// Human-readable summary appended to hints.
 pub fn summarize(p: &Profile) -> String {
     let mut s = String::new();

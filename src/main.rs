@@ -16,6 +16,7 @@ mod progress;
 mod report;
 mod routes;
 mod server;
+mod trace;
 mod ui;
 
 use anyhow::{bail, Result};
@@ -60,6 +61,8 @@ enum Cmd {
         walks: usize,
         #[arg(long, help = "profile live endpoints: names, open ports, device class")]
         deep: bool,
+        #[arg(long, default_value_t = 30, help = "retire inventory devices unseen this many days")]
+        retire_days: u64,
         #[arg(long, help = "do not auto-seed from local interfaces/routes")]
         no_auto: bool,
         #[arg(long, default_value = "output", help = "output directory")]
@@ -199,6 +202,7 @@ fn main() -> Result<()> {
             full,
             walks,
             deep,
+            retire_days,
             no_auto,
             out,
         } => {
@@ -221,6 +225,7 @@ fn main() -> Result<()> {
                 out_dir: out.clone(),
                 walk_budget: walks,
                 deep,
+                retire_days,
             })?;
             let store = db::Db::open(&out.join("ops.db"))?;
             {
@@ -277,6 +282,7 @@ fn main() -> Result<()> {
             let store = Arc::new(db::Db::open(&out.join("ops.db"))?);
             jobs::start_housekeeping(Arc::clone(&store));
             jobs::start_webhook_sender(Arc::clone(&store));
+            jobs::start_report_writer(Arc::clone(&store), out.clone());
             monitor::run(monitor::Params {
                 check: check::Params {
                     extra_subnets: parse_subnets(subnets)?,

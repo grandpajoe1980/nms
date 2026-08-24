@@ -424,6 +424,18 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
     }
 
     tx.commit()?;
+
+    // Retire inventory entries absent beyond the configured window so that
+    // decommissioned devices disappear instead of lingering as down forever.
+    let retire_days = setting_i64(&conn, "absent_retire_days", 30);
+    if retire_days > 0 {
+        match db::retire_absent_devices(&conn, now - retire_days * 86_400) {
+            Ok(n) if n > 0 => println!("[ops] retired {n} absent device(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("[ops] retirement failed: {e}"),
+        }
+    }
+
     stats.new_events = fresh_alerts.len();
     stats.duration_ms = t0.elapsed().as_millis() as u64;
     Ok(stats)
