@@ -48,7 +48,8 @@ pub struct DeviceRec {
     pub down_since_ts: Option<i64>,
     pub maintenance_until_ts: Option<i64>,
     pub flap_count: i64,
-    pub notes: Option<String>,
+    pub hostname: Option<String>,
+    pub device_class: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +113,13 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        // Lightweight migrations (ignore failures when column already exists).
+        for stmt in [
+            "ALTER TABLE devices ADD COLUMN hostname TEXT",
+            "ALTER TABLE devices ADD COLUMN device_class TEXT",
+        ] {
+            let _ = conn.execute(stmt, []);
+        }
         for (k, v) in DEFAULT_SETTINGS {
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?1, ?2)",
@@ -240,6 +248,22 @@ CREATE TABLE IF NOT EXISTS outbound(
   payload    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound(status, created_ts);
+CREATE TABLE IF NOT EXISTS device_diag(
+  device_id INTEGER PRIMARY KEY,
+  ts        INTEGER NOT NULL,
+  sent      INTEGER NOT NULL,
+  recv      INTEGER NOT NULL,
+  loss_pct  REAL NOT NULL,
+  rtt_min   REAL,
+  rtt_avg   REAL,
+  rtt_max   REAL,
+  rtt_p95   REAL,
+  jitter_ms REAL,
+  score     INTEGER NOT NULL,
+  verdict   TEXT NOT NULL,
+  open_ports TEXT,
+  method    TEXT
+);
 "#;
 
 // ---------------------------------------------------------------- settings
@@ -354,13 +378,14 @@ fn row_device(r: &Row) -> rusqlite::Result<DeviceRec> {
         down_since_ts: r.get(16)?,
         maintenance_until_ts: r.get(17)?,
         flap_count: r.get(18)?,
-        notes: r.get(19)?,
+        hostname: r.get(19)?,
+        device_class: r.get(20)?,
     })
 }
 
-const DEVICE_COLS: &str = "id, ip, mac, name, role, site_id, site_source, parent_id, managed, \
-     poll_secs, first_seen_ts, last_seen_ts, ever_up, state, eff_state, perf_status, \
-     down_since_ts, maintenance_until_ts, flap_count, notes";
+const DEVICE_COLS: &str = "id, ip, mac, name, role, site_id, site_source, parent_id, managed,
+     poll_secs, first_seen_ts, last_seen_ts, ever_up, state, eff_state, perf_status,
+     down_since_ts, maintenance_until_ts, flap_count, hostname, device_class";
 
 pub fn device_by_ip(conn: &Connection, ip: &str) -> Result<Option<DeviceRec>> {
     let sql = format!("SELECT {DEVICE_COLS} FROM devices WHERE ip = ?1");
@@ -394,6 +419,8 @@ pub struct DeviceUpdate<'a> {
     pub rtt_ms: Option<f64>,
     pub ts: i64,
     pub site_prefix: u8,
+    pub hostname: Option<String>,
+    pub device_class: Option<String>,
 }
 
 /// Upsert by IP. Manual site assignment (`site_source='manual'`) and the
@@ -422,6 +449,14 @@ pub fn upsert_device(conn: &Connection, u: &DeviceUpdate) -> Result<DeviceRec> {
         None => None,
     };
     let mac = u.mac.clone().or_else(|| existing.as_ref().and_then(|d| d.mac.clone()));
+    let hostname = u
+        .hostname
+        .clone()
+        .or_else(|| existing.as_ref().and_then(|d| d.hostname.clone()));
+    let device_class = u
+        .device_class
+        .clone()
+        .or_else(|| existing.as_ref().and_then(|d| d.device_class.clone()));
     let ever_up = existing.as_ref().is_some_and(|d| d.ever_up) || u.up_now;
     let (first, last) = match &existing {
         Some(d) => (d.first_seen_ts, u.ts),
@@ -429,8 +464,8 @@ pub fn upsert_device(conn: &Connection, u: &DeviceUpdate) -> Result<DeviceRec> {
     };
     conn.execute(
         "INSERT INTO devices(ip, mac, role, site_id, site_source, parent_id, first_seen_ts,
-             last_seen_ts, ever_up, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             last_seen_ts, ever_up, state, hostname, device_class)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(ip) DO UPDATE SET
              mac = excluded.mac,
              role = excluded.role,
@@ -440,7 +475,9 @@ pub fn upsert_device(conn: &Connection, u: &DeviceUpdate) -> Result<DeviceRec> {
              parent_id = excluded.parent_id,
              last_seen_ts = excluded.last_seen_ts,
              ever_up = MAX(devices.ever_up, excluded.ever_up),
-             state = excluded.state",
+             state = excluded.state,
+             hostname = COALESCE(excluded.hostname, devices.hostname),
+             device_class = COALESCE(excluded.device_class, devices.device_class)",
         params![
             u.ip,
             mac,
@@ -451,7 +488,9 @@ pub fn upsert_device(conn: &Connection, u: &DeviceUpdate) -> Result<DeviceRec> {
             first,
             last,
             ever_up as i64,
-            u.state
+            u.state,
+            hostname,
+            device_class
         ],
     )?;
     let rec = device_by_ip(conn, u.ip)?.context("device vanished after upsert")?;
@@ -942,6 +981,68 @@ pub fn epoch_day(ts: i64) -> i64 {
     ts - ts.rem_euclid(86_400)
 }
 
+// ------------------------------------------------------------------- diag
+
+#[allow(clippy::too_many_arguments)]
+pub fn save_diag(
+    conn: &Connection,
+    device_id: i64,
+    ts: i64,
+    sent: i64,
+    recv: i64,
+    loss_pct: f64,
+    rtt_min: Option<f64>,
+    rtt_avg: Option<f64>,
+    rtt_max: Option<f64>,
+    rtt_p95: Option<f64>,
+    jitter_ms: Option<f64>,
+    score: i64,
+    verdict: &str,
+    open_ports: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO device_diag(device_id, ts, sent, recv, loss_pct, rtt_min, rtt_avg,
+             rtt_max, rtt_p95, jitter_ms, score, verdict, open_ports)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         ON CONFLICT(device_id) DO UPDATE SET
+             ts=excluded.ts, sent=excluded.sent, recv=excluded.recv,
+             loss_pct=excluded.loss_pct, rtt_min=excluded.rtt_min, rtt_avg=excluded.rtt_avg,
+             rtt_max=excluded.rtt_max, rtt_p95=excluded.rtt_p95, jitter_ms=excluded.jitter_ms,
+             score=excluded.score, verdict=excluded.verdict, open_ports=excluded.open_ports",
+        params![device_id, ts, sent, recv, loss_pct, rtt_min, rtt_avg, rtt_max, rtt_p95,
+                jitter_ms, score, verdict, open_ports],
+    )?;
+    Ok(())
+}
+
+pub fn latest_diag(conn: &Connection, device_id: i64) -> Result<Option<serde_json::Value>> {
+    let res = conn
+        .query_row(
+            "SELECT ts, sent, recv, loss_pct, rtt_min, rtt_avg, rtt_max, rtt_p95, jitter_ms,
+                    score, verdict, open_ports
+             FROM device_diag WHERE device_id = ?1",
+            params![device_id],
+            |r| {
+                Ok(serde_json::json!({
+                    "ts": r.get::<_, i64>(0)?,
+                    "sent": r.get::<_, i64>(1)?,
+                    "recv": r.get::<_, i64>(2)?,
+                    "loss_pct": r.get::<_, f64>(3)?,
+                    "rtt_min": r.get::<_, Option<f64>>(4)?,
+                    "rtt_avg": r.get::<_, Option<f64>>(5)?,
+                    "rtt_max": r.get::<_, Option<f64>>(6)?,
+                    "rtt_p95": r.get::<_, Option<f64>>(7)?,
+                    "jitter_ms": r.get::<_, Option<f64>>(8)?,
+                    "score": r.get::<_, i64>(9)?,
+                    "verdict": r.get::<_, String>(10)?,
+                    "open_ports": r.get::<_, Option<String>>(11)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(res)
+}
+
 pub fn epoch_hour(ts_millis: i64) -> i64 {
     let secs = ts_millis / 1000;
     secs - secs.rem_euclid(3600)
@@ -980,6 +1081,8 @@ mod tests {
             rtt_ms: Some(5.0),
             ts: 1_000,
             site_prefix: 24,
+            hostname: None,
+            device_class: None,
         };
         let d1 = upsert_device(&c, &u).unwrap();
         assert_eq!(site_name(&c, d1.site_id), "10.0.0/24");

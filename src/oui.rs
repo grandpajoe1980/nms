@@ -2,7 +2,7 @@ pub fn mac_str(m: &[u8; 6]) -> String {
     m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
 }
 
-const WIFI: &[(&str, &str)] = &[
+pub const WIFI: &[(&str, &str)] = &[
     ("00:02:6f", "EnGenius/Senao"),
     ("00:0b:86", "Aruba"),
     ("00:18:0a", "Cisco Meraki"),
@@ -49,7 +49,7 @@ const WIFI: &[(&str, &str)] = &[
     ("00:05:85", "Juniper"),
 ];
 
-const ROUTERS: &[(&str, &str)] = &[
+pub const ROUTERS: &[(&str, &str)] = &[
     ("04:18:d6", "Ubiquiti EdgeMAX"),
     ("48:8f:5a", "MikroTik"),
     ("64:d1:54", "MikroTik"),

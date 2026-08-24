@@ -191,6 +191,8 @@ pub fn sweep_once(p: &Params) -> Result<RunResult> {
                         ever_up: true,
                         wap: None,
                         wap_source: None,
+                        hostname: None,
+                        device_class: None,
                     });
                     transitions.push(Transition {
                         ip: o.ip,

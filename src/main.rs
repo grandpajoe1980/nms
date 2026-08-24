@@ -1,6 +1,7 @@
 mod arp;
 mod check;
 mod db;
+mod diag;
 mod discover;
 mod engine;
 mod jobs;
@@ -10,6 +11,7 @@ mod netutil;
 mod ops;
 mod oui;
 mod ping;
+mod profile;
 mod progress;
 mod report;
 mod routes;
@@ -56,6 +58,8 @@ enum Cmd {
         full: bool,
         #[arg(long, default_value_t = 150, help = "max TTL-walk paths for router discovery (0 disables)")]
         walks: usize,
+        #[arg(long, help = "profile live endpoints: names, open ports, device class")]
+        deep: bool,
         #[arg(long, help = "do not auto-seed from local interfaces/routes")]
         no_auto: bool,
         #[arg(long, default_value = "output", help = "output directory")]
@@ -194,6 +198,7 @@ fn main() -> Result<()> {
             sample,
             full,
             walks,
+            deep,
             no_auto,
             out,
         } => {
@@ -215,6 +220,7 @@ fn main() -> Result<()> {
                 },
                 out_dir: out.clone(),
                 walk_budget: walks,
+                deep,
             })?;
             let store = db::Db::open(&out.join("ops.db"))?;
             {

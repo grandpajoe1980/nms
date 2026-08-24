@@ -55,6 +55,10 @@ pub struct Device {
     pub wap: Option<Ipv4Addr>,
     #[serde(default)]
     pub wap_source: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub device_class: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

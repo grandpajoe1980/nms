@@ -1,6 +1,7 @@
 use crate::check::{self, Transition};
 use crate::db;
 use crate::discover;
+use rusqlite::Connection;
 use crate::engine::ScanParams;
 use crate::model::{Model, State};
 use crate::report;
@@ -223,6 +224,8 @@ fn route(method: &str, path: &str, query: &str, body: &str, shared: &Arc<Shared>
         ("POST", "/api/device") => device_action(body, shared),
         ("POST", "/api/event/ack") => event_ack(body, shared),
         ("POST", "/api/webhook/test") => webhook_test(shared),
+        ("POST", "/api/diagnose") => diagnose_endpoint(query, shared),
+        ("POST", "/api/suggest_wap") => suggest_wap_endpoint(query, shared),
         ("GET", "/api/dashboard.json") => dashboard_json(shared),
         _ if method == "GET" && path.starts_with("/device/") && !path.ends_with(".json") => {
             let ip = url_decode(path.trim_start_matches("/device/"));
@@ -443,8 +446,166 @@ fn event_ack(body: &str, shared: &Arc<Shared>) -> Vec<u8> {
     see_other("/events")
 }
 
-fn webhook_test(shared: &Arc<Shared>) -> Vec<u8> {
+fn diagnose_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
+    let Some(ip) = query_param(query, "ip").and_then(|v| v.parse::<Ipv4Addr>().ok()) else {
+        return json("400 Bad Request", serde_json::json!({"error":"query parameter ip is required"}));
+    };
+    let count: u32 = query_param(query, "count").and_then(|v| v.parse().ok()).unwrap_or(40);
+    let count = count.clamp(5, 200);
+    let started = std::time::Instant::now();
+    let diag = match crate::diag::run_burst(ip, count, 25.0, 1000) {
+        Ok(d) => d,
+        Err(e) => return json("500 Internal Server Error", serde_json::json!({"error": e.to_string()})),
+    };
+    let (role_hint, mac_hint) = {
+        let conn = shared.store.lock();
+        match db::device_by_ip(&conn, &ip.to_string()) {
+            Ok(Some(d)) => (d.role, d.mac),
+            _ => ("endpoint".into(), None),
+        }
+    };
+    let prof = crate::profile::profile_endpoint(ip, mac_hint.as_deref(), &role_hint);
+    {
+        let conn = shared.store.lock();
+        if let Ok(Some(dev)) = db::device_by_ip(&conn, &ip.to_string()) {
+            let ports = prof
+                .open_ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = db::save_diag(
+                &conn,
+                dev.id,
+                chrono::Utc::now().timestamp(),
+                diag.sent as i64,
+                diag.recv as i64,
+                diag.loss_pct,
+                diag.rtt_min,
+                diag.rtt_avg,
+                diag.rtt_max,
+                diag.rtt_p95,
+                diag.jitter_ms,
+                diag.score,
+                diag.verdict,
+                (!ports.is_empty()).then_some(ports.as_str()),
+            );
+        }
+    }
+    let services: Vec<serde_json::Value> = prof
+        .open_ports
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "port": p,
+                "service": crate::profile::service_names().get(p).copied().unwrap_or("?"),
+            })
+        })
+        .collect();
+    json(
+        "200 OK",
+        serde_json::json!({
+            "diag": diag,
+            "hostname": prof.hostname,
+            "device_class": prof.device_class,
+            "services": services,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    )
+}
+
+fn suggest_wap_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
+    let Some(ip) = query_param(query, "ip") else {
+        return json("400 Bad Request", serde_json::json!({"error":"query parameter ip is required"}));
+    };
     let conn = shared.store.lock();
+    let Some(dev) = db::device_by_ip(&conn, &ip).ok().flatten() else {
+        return json("404 Not Found", serde_json::json!({"error":"unknown device"}));
+    };
+    match wap_suggestion(&conn, dev.id, dev.site_id) {
+        Some((wap_ip, r, n)) => json(
+            "200 OK",
+            serde_json::json!({"ip": ip, "wap": wap_ip, "correlation": r, "pairs": n}),
+        ),
+        None => json(
+            "200 OK",
+            serde_json::json!({"ip": ip, "suggestion": null,
+                "note": "not enough aligned latency samples yet"}),
+        ),
+    }
+}
+
+/// Pearson correlation between the endpoint's RTT series and each candidate
+/// WAP's series (samples paired within ±2.5 s). High correlation suggests the
+/// endpoint rides that AP's radio/link.
+fn wap_suggestion(
+    conn: &Connection,
+    device_id: i64,
+    site_id: Option<i64>,
+) -> Option<(String, f64, usize)> {
+    fn rtt_series(conn: &Connection, id: i64, limit: i64) -> Vec<(i64, f64)> {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT ts, rtt_ms FROM samples WHERE device_id=?1 AND up=1 AND rtt_ms IS NOT NULL
+             ORDER BY ts DESC LIMIT ?2",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(rusqlite::params![id, limit], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    let ep = rtt_series(conn, device_id, 60);
+    if ep.len() < 8 {
+        return None;
+    }
+    let waps: Vec<(i64, String)> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, ip FROM devices WHERE role='wap' AND managed=1
+             AND (?1 IS NULL OR site_id = ?1)",
+        ) else {
+            return None;
+        };
+        stmt.query_map(rusqlite::params![site_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    };
+    let mut best: Option<(String, f64, usize)> = None;
+    for (wid, wip) in waps {
+        let ws = rtt_series(conn, wid, 120);
+        let mut pairs: Vec<(f64, f64)> = Vec::new();
+        for &(ets, ertt) in &ep {
+            if let Some(&(_, wrtt)) =
+                ws.iter().find(|(ts, _)| (ts - ets).abs() <= 2500)
+            {
+                pairs.push((ertt, wrtt));
+            }
+        }
+        if pairs.len() < 8 {
+            continue;
+        }
+        let n = pairs.len() as f64;
+        let mx = pairs.iter().map(|p| p.0).sum::<f64>() / n;
+        let my = pairs.iter().map(|p| p.1).sum::<f64>() / n;
+        let cov: f64 = pairs.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+        let vx: f64 = pairs.iter().map(|p| (p.0 - mx).powi(2)).sum();
+        let vy: f64 = pairs.iter().map(|p| (p.1 - my).powi(2)).sum();
+        if vx < 0.01 || vy < 0.01 {
+            continue;
+        }
+        let r = cov / (vx.sqrt() * vy.sqrt());
+        if best.as_ref().is_none_or(|(_, br, _)| r.abs() > br.abs()) {
+            best = Some((wip, r, pairs.len()));
+        }
+    }
+    best.filter(|(_, r, _)| r.abs() >= 0.7)
+}
+
+fn webhook_test(shared: &Arc<Shared>) -> Vec<u8> {    let conn = shared.store.lock();
     let url = db::get_setting_or(&conn, "webhook_url", "");
     if url.is_empty() {
         return json("400 Bad Request", serde_json::json!({"error":"webhook_url is not configured"}));
@@ -510,6 +671,7 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
             scan: ScanParams { rate_pps: 2000.0, concurrency: 512, timeout_ms: 500, payload_len: 32 },
             out_dir: p.out_dir.clone(),
             walk_budget: 24,
+            deep: true,
         })
         .map(|m| {
             if let Ok(ids) = crate::ops::sync_model(

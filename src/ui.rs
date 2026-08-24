@@ -245,12 +245,14 @@ pub fn dashboard(conn: &Connection) -> String {
 
 // ------------------------------------------------------------------ devices
 
-type DeviceRow = (String, String, String, String, Option<String>, Option<String>, i64);
+type DeviceRow = (String, String, String, String, Option<String>, Option<String>, String, String, i64);
 
 pub fn devices_page(conn: &Connection, state: &str, q: &str) -> String {
     let mut sql = String::from(
         "SELECT ip, role, eff_state, perf_status, mac,
-            (SELECT name FROM sites WHERE id = devices.site_id) AS site, last_seen_ts
+            (SELECT name FROM sites WHERE id = devices.site_id) AS site,
+            COALESCE(hostname, '') AS hostname, COALESCE(device_class,'') AS class,
+            last_seen_ts
          FROM devices WHERE 1=1",
     );
     let mut args: Vec<rusqlite::types::Value> = Vec::new();
@@ -269,7 +271,15 @@ pub fn devices_page(conn: &Connection, state: &str, q: &str) -> String {
         .and_then(|mut stmt| {
             stmt.query_map(rusqlite::params_from_iter(args), |r| {
                 Ok((
-                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    r.get(8)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -288,16 +298,26 @@ pub fn devices_page(conn: &Connection, state: &str, q: &str) -> String {
     let _ = write!(body,
         "</select><input name=\"q\" placeholder=\"ip or mac contains\u{2026}\" value=\"{q_esc}\">\
 <button type=\"submit\">filter</button> <a href=\"/devices\">reset</a></form>\
-<table><tr><th>ip</th><th>role</th><th>state</th><th>perf</th><th>mac</th><th>site</th><th>seen</th></tr>");
+<table><tr><th>ip</th><th>class</th><th>host</th><th>role</th><th>state</th><th>perf</th><th>mac</th><th>site</th><th>seen</th></tr>");
 
-    for (ip, role, st, perf, mac, site, seen) in rows {
+    for (ip, role, st, perf, mac, site, hostname, class, seen) in rows {
         let perf_disp = if perf == "ok" {
             "-".to_string()
         } else {
             badge(perf.trim_start_matches("latency_").trim_start_matches("loss_"))
         };
+        let host_disp = if hostname.is_empty() {
+            "-".to_string()
+        } else {
+            esc(&hostname)
+        };
+        let class_disp = if class.is_empty() || class == "unknown" {
+            "-".to_string()
+        } else {
+            esc(&class)
+        };
         let _ = write!(body,
-            "<tr><td><a href=\"/device/{ip}\">{ip}</a></td><td>{role}</td><td>{}</td><td>{perf_disp}</td>\
+            "<tr><td><a href=\"/device/{ip}\">{ip}</a></td><td>{class_disp}</td><td>{host_disp}</td><td>{role}</td><td>{}</td><td>{perf_disp}</td>\
 <td class=\"mono muted\">{}</td><td>{}</td><td class=\"muted\">{}</td></tr>",
             badge(&st),
             mac.as_deref().unwrap_or("-"),
@@ -342,6 +362,8 @@ pub fn device_detail(conn: &Connection, ip: &str) -> String {
 <tr><td>perf</td><td>{}</td></tr>\
 <tr><td>mac</td><td class=\"mono\">{}</td></tr>\
 <tr><td>site</td><td>{}</td></tr>\
+<tr><td>hostname</td><td class=\"mono\">{}</td></tr>\
+<tr><td>device class</td><td>{}</td></tr>\
 <tr><td>parent</td><td>{parent}</td></tr>\
 <tr><td>first / last seen</td><td>{} / {}</td></tr>\
 <tr><td>flaps (window)</td><td>{}</td></tr>\
@@ -351,6 +373,12 @@ pub fn device_detail(conn: &Connection, ip: &str) -> String {
         if d.perf_status == "ok" { "-".to_string() } else { badge(&d.perf_status) },
         d.mac.as_deref().unwrap_or("-"),
         esc(&db::site_name(conn, d.site_id)),
+        esc(d.hostname.as_deref().unwrap_or("-")),
+        if d.device_class.as_deref().unwrap_or("unknown") == "unknown" {
+            "-".to_string()
+        } else {
+            badge(d.device_class.as_deref().unwrap_or("unknown"))
+        },
         hhmm(d.first_seen_ts),
         hhmm(d.last_seen_ts),
         d.flap_count,
@@ -373,6 +401,65 @@ pub fn device_detail(conn: &Connection, ip: &str) -> String {
 <form class=\"inline\" method=\"post\" action=\"/api/device\">\
 <input type=\"hidden\" name=\"ip\" value=\"{ip}\"><input type=\"hidden\" name=\"action\" value=\"managed\">\
 <input type=\"hidden\" name=\"value\" value=\"{mgval}\"><button>{mgbtn}</button></form></div>");
+
+    let ip_js = esc(ip);
+    let _ = write!(body,
+        "<div class=\"panel\" style=\"margin:10px 0\"><h2>Diagnostics &amp; WAP inference</h2>\
+<button onclick=\"runDiag('{ip_js}')\">Run diagnostics</button> &nbsp;\
+<button onclick=\"suggestWap('{ip_js}')\">Suggest WAP</button> &nbsp;\
+<span id=\"pingone\" class=\"muted\"></span>\
+<div id=\"diagout\" class=\"muted\" style=\"margin-top:8px\">burst pings measure loss / jitter / percentiles — ICMP responsiveness, not Mbps bandwidth.</div></div>\
+<script>
+const escHtml = s => {{ const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }};
+const fmt1 = v => v == null ? '-' : Number(v).toFixed(1);
+async function runDiag(ip) {{
+  const el = document.getElementById('diagout');
+  el.textContent = 'running burst ping + port probe…';
+  try {{
+    const r = await fetch('/api/diagnose?ip=' + encodeURIComponent(ip), {{ method: 'POST' }});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    const g = d.diag;
+    const svcs = (d.services || []).map(s => s.port + '(' + s.service + ')').join(', ');
+    el.innerHTML = '<b>score ' + g.score + '/100 (' + g.verdict + ')</b> · loss ' +
+      g.loss_pct.toFixed(0) + '% · avg ' + fmt1(g.rtt_avg) + 'ms · min/max ' +
+      fmt1(g.rtt_min) + '/' + fmt1(g.rtt_max) + 'ms · p95 ' + fmt1(g.rtt_p95) +
+      'ms · jitter ' + fmt1(g.jitter_ms) + 'ms<br>class: <b>' + escHtml(d.device_class) +
+      '</b>' + (d.hostname ? ' · host ' + escHtml(d.hostname) : '') +
+      (svcs ? ' · open ports ' + escHtml(svcs) : '');
+  }} catch (e) {{ el.textContent = 'diagnostics failed: ' + e.message; }}
+}}
+async function suggestWap(ip) {{
+  const el = document.getElementById('diagout');
+  el.textContent = 'correlating latency with candidate WAPs…';
+  try {{
+    const r = await fetch('/api/suggest_wap?ip=' + encodeURIComponent(ip), {{ method: 'POST' }});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    if (!d.wap) {{ el.textContent = d.note || 'no confident suggestion'; return; }}
+    const pct = Math.round(Math.abs(d.correlation) * 100);
+    el.innerHTML = 'suggested WAP <b>' + escHtml(d.wap) + '</b> (latency correlation ' +
+      pct + '% over ' + d.pairs + ' paired probes) ';
+    const btn = document.createElement('button');
+    btn.textContent = 'apply';
+    btn.onclick = () => applyWap(ip, d.wap);
+    el.appendChild(btn);
+  }} catch (e) {{ el.textContent = 'suggestion failed: ' + e.message; }}
+}}
+async function applyWap(ip, wap) {{
+  const r = await fetch('/api/associate?device=' + ip + '&wap=' + wap, {{ method: 'POST' }});
+  if (r.ok) location.reload();
+}}
+async function pingOne() {{
+  try {{
+    const r = await fetch('/api/ping?ip=' + encodeURIComponent('{ip_js}'), {{ method: 'POST' }});
+    const d = await r.json();
+    document.getElementById('pingone').textContent = d.ip + (d.up ? ' UP ' : ' DOWN ') +
+      (d.rtt_ms == null ? '' : d.rtt_ms.toFixed(1) + 'ms');
+  }} catch (e) {{ document.getElementById('pingone').textContent = 'ping failed'; }}
+}}
+pingOne();
+</script>");
 
     let chart = svg_line(&spark, 600, 120, "var(--info)", "ms");
     let timeline = svg_timeline(&segs, now - 86_400, now);

@@ -26,6 +26,8 @@ pub struct Params {
     pub out_dir: PathBuf,
     /// max TTL-walk paths probed during classification (0 disables)
     pub walk_budget: usize,
+    /// profile live endpoints: reverse-DNS names, TCP port fingerprint, class
+    pub deep: bool,
 }
 
 struct Acc {
@@ -338,6 +340,8 @@ pub fn run(p: Params) -> Result<Model> {
             ever_up: true,
             wap: None,
             wap_source: None,
+            hostname: None,
+            device_class: None,
         });
     }
 
@@ -391,6 +395,49 @@ pub fn run(p: Params) -> Result<Model> {
         }
     }
     devices.sort_by_key(|d| u32::from(d.ip));
+
+    if p.deep {
+        let live: Vec<usize> = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.state == State::Up && d.role == Role::Endpoint)
+            .map(|(i, _)| i)
+            .collect();
+        println!("[*] deep discovery: profiling {} live endpoint(s)", live.len());
+        let profiles: std::sync::Mutex<HashMap<Ipv4Addr, crate::profile::Profile>> =
+            std::sync::Mutex::new(HashMap::new());
+        for chunk in live.chunks(32) {
+            std::thread::scope(|s| {
+                for &i in chunk {
+                    let (ip, mac) = {
+                        let d = &devices[i];
+                        (d.ip, d.mac.clone())
+                    };
+                    let profiles = &profiles;
+                    s.spawn(move || {
+                        let prof = crate::profile::profile_endpoint(
+                            ip,
+                            mac.as_deref(),
+                            "endpoint",
+                        );
+                        profiles.lock().unwrap().insert(ip, prof);
+                    });
+                }
+            });
+        }
+        let map = profiles.into_inner().unwrap();
+        for d in devices.iter_mut() {
+            if let Some(prof) = map.get(&d.ip) {
+                d.hostname = prof.hostname.clone();
+                d.device_class = Some(prof.device_class.clone());
+                let summary = crate::profile::summarize(prof);
+                if !summary.is_empty() {
+                    d.hint = Some(summary);
+                }
+            }
+        }
+        println!("[*] profiled {} host(s)", map.len());
+    }
 
     let mut edges: BTreeSet<(String, String, String)> = BTreeSet::new();
     for (n, _cidr, _) in &subnet_list {

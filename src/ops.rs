@@ -63,6 +63,8 @@ pub fn sync_model(conn: &Connection, model: &Model, site_prefix: u8) -> Result<H
                 rtt_ms: d.rtt_ms,
                 ts: now,
                 site_prefix,
+                hostname: d.hostname.clone(),
+                device_class: d.device_class.clone(),
             },
         )?;
         ids.insert(rec.ip.clone(), rec.id);
