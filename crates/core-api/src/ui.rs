@@ -947,11 +947,37 @@ pub fn settings_page(conn: &Connection, saved: bool) -> String {
 use engine::reports::availability_rows;
 pub fn reports_page(conn: &Connection, hours: i64) -> String {
     let rows = availability_rows(conn, hours);
-    let mttr = db::mttr_secs_window(conn, chrono::Utc::now().timestamp() - hours * 3600);
+    let since = chrono::Utc::now().timestamp() - hours * 3600;
+    let mttr = db::mttr_secs_window(conn, since);
     let mttr_s = mttr.map(|v| format!("{v:.0}s")).unwrap_or_else(|| "-".into());
+    let mtta = db::mtta_secs_window(conn, since).ok().flatten();
+    let mtta_s = mtta.map(|v| format!("{v:.0}s")).unwrap_or_else(|| "-".into());
     let target: f64 = db::get_setting_or(conn, "sla_target_pct", "99.5")
         .parse()
         .unwrap_or(99.5);
+    let open_crit_warn: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE state='open' AND severity IN ('critical','warning')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let resolved_in_window: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE cleared_ts IS NOT NULL AND cleared_ts >= ?1",
+            [since],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let sites_total = rows.len();
+    let sites_missing_sla = rows
+        .iter()
+        .filter(|(_, _, _, _, pct, _)| *pct < target)
+        .count();
+    let worst_site = rows
+        .first()
+        .map(|(site, _, _, _, pct, _)| format!("{} ({pct:.2}%)", esc(site)))
+        .unwrap_or_else(|| "-".into());
     let mut body = String::new();
     let _ = write!(body,
         "<div style=\"display:flex;gap:8px;margin-bottom:10px;align-items:center\">\
@@ -959,6 +985,7 @@ pub fn reports_page(conn: &Connection, hours: i64) -> String {
 <a class=\"badge b-info\" href=\"/reports?hours=168\">7d</a>\
 <a class=\"badge b-info\" href=\"/reports?hours=720\">30d</a>\
 <span class=\"muted\">MTTR over window: <b>{mttr_s}</b></span>\
+<span class=\"muted\">MTTA over window: <b>{mtta_s}</b></span>\
 <span class=\"muted\">SLA target: <b>{target:.2}%</b> (set sla_target_pct in Settings)</span>\
 <a style=\"margin-left:auto\" href=\"/api/report/availability.csv?hours={hours}\">download site csv</a></div>\
 <table><tr><th>site</th><th>devices</th><th>probes</th><th>uptime</th><th>SLA</th><th>avg rtt</th><th>per-device csv</th></tr>");
@@ -979,6 +1006,13 @@ pub fn reports_page(conn: &Connection, hours: i64) -> String {
             esc(site));
     }
     body.push_str("</table>");
+    let _ = write!(body,
+        "<div class=\"panel\"><h3 style=\"margin-top:0\">Executive digest</h3><table>\
+<tr><th>window</th><th>open criticals / warnings</th><th>resolved in window</th>\
+<th>sites missing SLA</th><th>worst site (uptime)</th></tr>\
+<tr><td class=\"mono\">{hours}h</td><td class=\"mono\">{open_crit_warn}</td>\
+<td class=\"mono\">{resolved_in_window}</td>\
+<td class=\"mono\">{sites_missing_sla} / {sites_total}</td><td>{worst_site}</td></tr></table></div>");
     page(conn, "Reports", "Reports", &body)
 }
 
@@ -1156,5 +1190,63 @@ mod tests {
         assert!(!html.contains("<script>x</script>"));
         assert!(html.contains("&lt;script&gt;x&lt;/script&gt;"));
         assert!(html.contains("<td>-</td>"));
+    }
+
+    #[test]
+    fn reports_page_shows_mtta_and_executive_digest() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        upsert(&conn, "10.9.0.7", "router");
+        let now = chrono::Utc::now().timestamp();
+        let acked = db::create_event(
+            &conn,
+            Some(1),
+            Some("10.9.0.7"),
+            "device_down",
+            "critical",
+            "router down",
+            None,
+            now - 3_600,
+        )
+        .unwrap();
+        db::ack_event(&conn, acked.id, true, "web", now - 3_540).unwrap();
+        let cleared = db::create_event(
+            &conn,
+            Some(1),
+            Some("10.9.0.7"),
+            "high_latency",
+            "warning",
+            "latency spike",
+            None,
+            now - 7_200,
+        )
+        .unwrap();
+        db::clear_event(&conn, cleared.id, now - 60).unwrap();
+        let html = reports_page(&conn, 24);
+        // no segments -> MTTR "-", acked critical -> MTTA 60s
+        assert!(html.contains("MTTR over window: <b>-</b>"));
+        assert!(html.contains("MTTA over window: <b>60s</b>"));
+        // digest: 1 open crit/warn (acked one), 1 resolved in window,
+        // 1/1 sites missing SLA (no rollups -> 0.00% uptime), worst site named
+        assert!(html.contains("<h3 style=\"margin-top:0\">Executive digest</h3>"));
+        assert!(html.contains(">open criticals / warnings<"));
+        assert!(html.contains("<td class=\"mono\">1</td>"));
+        assert!(html.contains(">resolved in window<"));
+        assert!(html.contains("<td class=\"mono\">1 / 1</td>"));
+        assert!(html.contains(">sites missing SLA<"));
+        assert!(html.contains(">worst site (uptime)<"));
+        assert!(html.contains("<td>unassigned (0.00%)</td>"));
+    }
+
+    #[test]
+    fn reports_page_empty_db_digest_defaults() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        let html = reports_page(&conn, 168);
+        assert!(html.contains("MTTA over window: <b>-</b>"));
+        assert!(html.contains("Executive digest"));
+        assert!(html.contains("<td class=\"mono\">0</td>"));
+        assert!(html.contains("<td class=\"mono\">0 / 0</td>"));
+        assert!(html.contains("<td>-</td>")); // worst site placeholder
     }
 }

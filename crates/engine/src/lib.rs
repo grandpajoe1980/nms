@@ -3,6 +3,7 @@
 
 pub mod arp;
 pub mod auth;
+pub mod cfgmod;
 pub mod check;
 pub mod db;
 pub mod diag;

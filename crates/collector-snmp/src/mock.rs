@@ -1,9 +1,12 @@
-//! Mock SNMP agent used by the fixture tests: answers v2c GET (exact match)
-//! and GETNEXT (lexicographic successor over the varbind table, so arbitrary
-//! subtree walks work), enforcing community checks. Past the last varbind it
-//! reports v2c `endOfMibView`.
+//! Mock SNMP agent used by the fixture tests: answers v2c GET (exact match),
+//! GETNEXT (lexicographic successor over the varbind table, so arbitrary
+//! subtree walks work) and GETBULK (`max_repetitions` lexicographic
+//! successors per repetition, `endOfMibView` past the last varbind),
+//! enforcing community checks.
 
-use crate::{build_response_v2c, cmp_oid, parse_message, SnmpValue, TAG_PDU_GETNEXT};
+use crate::{
+    build_response_v2c, cmp_oid, parse_message, SnmpValue, TAG_PDU_GETBULK, TAG_PDU_GETNEXT,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -59,6 +62,39 @@ pub fn spawn(
                                         table.get(k).cloned().unwrap_or(SnmpValue::Null),
                                     )),
                                     None => out_vbs.push((oid, SnmpValue::EndOfMibView)),
+                                }
+                            }
+                        }
+                        TAG_PDU_GETBULK => {
+                            // RFC 3416 §4.2.3: the first `non_repeaters`
+                            // varbinds get one successor each; every repeated
+                            // varbind gets up to `max_repetitions` chained
+                            // successors with `endOfMibView` once the table is
+                            // exhausted (remaining repetitions included).
+                            for (i, (oid, _)) in msg.varbinds.iter().enumerate() {
+                                let reps = if (i as i16) < msg.non_repeaters {
+                                    1
+                                } else {
+                                    msg.max_repetitions.max(0) as usize
+                                };
+                                let mut cursor = oid.clone();
+                                for _ in 0..reps {
+                                    match keys.iter().find(|k| {
+                                        cmp_oid(k, &cursor) == std::cmp::Ordering::Greater
+                                    }) {
+                                        Some(k) => {
+                                            out_vbs.push((
+                                                k.clone(),
+                                                table.get(k).cloned().unwrap_or(SnmpValue::Null),
+                                            ));
+                                            cursor = k.clone();
+                                        }
+                                        None => {
+                                            // Exhausted: this repetition and all
+                                            // remaining ones report endOfMibView.
+                                            out_vbs.push((cursor.clone(), SnmpValue::EndOfMibView));
+                                        }
+                                    }
                                 }
                             }
                         }

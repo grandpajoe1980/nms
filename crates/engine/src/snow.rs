@@ -79,7 +79,9 @@ pub fn resolve_patch(event: &Value) -> Result<Value> {
     }))
 }
 
-fn is_recovery_kind(kind: &str) -> bool {
+/// Recovery kinds map to a ServiceNow close/update body; everything else
+/// creates or updates an open incident.
+pub fn is_recovery_kind(kind: &str) -> bool {
     kind == "device_up" || kind.ends_with("_cleared")
 }
 

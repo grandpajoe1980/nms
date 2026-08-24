@@ -61,9 +61,12 @@ pub fn start_webhook_sender(dbh: Arc<Db>) {
         .name("webhook-sender".into())
         .spawn(move || loop {
             std::thread::sleep(Duration::from_secs(5));
-            let enabled = {
+            let (enabled, snow_on) = {
                 let conn = dbh.lock();
-                db::get_setting_or(&conn, "webhook_enabled", "0") == "1"
+                (
+                    db::get_setting_or(&conn, "webhook_enabled", "0") == "1",
+                    db::get_setting_or(&conn, "snow_transform", "0") == "1",
+                )
             };
             if !enabled {
                 continue;
@@ -80,8 +83,17 @@ pub fn start_webhook_sender(dbh: Arc<Db>) {
                 db::pending_outbound(&conn, 25).unwrap_or_default()
             };
             for (id, payload) in batch {
+                let body = match transform_for_delivery(&payload, snow_on) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let conn = dbh.lock();
+                        let _ = db::mark_outbound(&conn, id, false, Some(&e));
+                        eprintln!("[jobs] webhook #{id} transform failed: {e}");
+                        continue;
+                    }
+                };
                 let value: serde_json::Value =
-                    serde_json::from_str(&payload).unwrap_or(serde_json::json!({"raw": payload}));
+                    serde_json::from_str(&body).unwrap_or(serde_json::json!({"raw": body}));
                 let res = send_webhook(&url, value);
                 let conn = dbh.lock();
                 match res {
@@ -97,6 +109,31 @@ pub fn start_webhook_sender(dbh: Arc<Db>) {
             }
         })
         .expect("spawn webhook sender");
+}
+
+/// Pure delivery-time transformer: raw v1 passthrough by default; when
+/// ServiceNow mode is on, convert to an incident body (or a resolve patch for
+/// recovery kinds). Malformed JSON in SNOW mode is an error, never dropped.
+fn transform_for_delivery(payload: &str, snow_on: bool) -> Result<String, String> {
+    if !snow_on {
+        return Ok(payload.to_string());
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|e| format!("payload not JSON: {e}"))?;
+    let kind = value
+        .pointer("/event/kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("")
+        .to_string();
+    if crate::snow::is_recovery_kind(&kind) {
+        let mapped =
+            crate::snow::resolve_patch(&value).map_err(|e| e.to_string())?;
+        Ok(serde_json::to_string(&mapped).map_err(|e| e.to_string())?)
+    } else {
+        let mapped =
+            crate::snow::to_incident_payload(&value).map_err(|e| e.to_string())?;
+        Ok(serde_json::to_string(&mapped).map_err(|e| e.to_string())?)
+    }
 }
 
 /// Hourly scheduled reporting: rolling 24h availability snapshot plus a
@@ -155,4 +192,45 @@ pub fn start_report_writer(dbh: Arc<Db>, out_dir: PathBuf) {
             }
         })
         .expect("spawn report writer");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const V1_DOWN: &str = r#"{"type":"nms.event","ts":"2026-08-24T12:00:00Z",
+        "event":{"id":42,"kind":"device_down","severity":"critical",
+                 "message":"router down","details":null,"created_ts":1000},
+        "device":{"ip":"10.20.30.1","role":"router","site":"hq-1"}}"#;
+    const V1_UP: &str = r#"{"type":"nms.event","ts":"2026-08-24T13:00:00Z",
+        "event":{"id":43,"kind":"device_up","severity":"info",
+                 "message":"back","details":null,"created_ts":2000},
+        "device":{"ip":"10.20.30.1","role":"router","site":"hq-1"}}"#;
+
+    #[test]
+    fn passthrough_when_snow_off() {
+        let out = transform_for_delivery(V1_DOWN, false).unwrap();
+        assert_eq!(out, V1_DOWN);
+    }
+
+    #[test]
+    fn snow_on_maps_incident_and_resolve() {
+        let down = transform_for_delivery(V1_DOWN, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&down).unwrap();
+        assert_eq!(v["impact"], "1");
+        assert_eq!(v["correlation_id"], "nms-42");
+        assert!(v["short_description"].as_str().unwrap().contains("down"));
+
+        let up = transform_for_delivery(V1_UP, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&up).unwrap();
+        assert_eq!(v["state"], "7");
+        assert!(v["close_notes"].as_str().unwrap().contains("Auto-resolved"));
+    }
+
+    #[test]
+    fn malformed_json_in_snow_mode_is_err() {
+        assert!(transform_for_delivery("{not json", true).is_err());
+        // and passthrough mode tolerates it
+        assert!(transform_for_delivery("{not json", false).is_ok());
+    }
 }

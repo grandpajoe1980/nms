@@ -1,7 +1,8 @@
-//! Minimal SNMP v2c client (GET + GETNEXT subtree walks) with a hand-rolled
-//! BER/ASN.1 codec, verified against an in-process mock UDP agent (see
-//! `mock`). Seeds FR-PRF-003 (polling framework: [`walk`]) and FR-DISC-003
-//! (interface inventory: [`walk_if_table`]); GETBULK + vendor profiles next.
+//! Minimal SNMP v2c client (GET + GETNEXT + GETBULK subtree walks) with a
+//! hand-rolled BER/ASN.1 codec, verified against an in-process mock UDP agent
+//! (see `mock`). Implements FR-PRF-003 (polling framework: [`walk`],
+//! [`getbulk`]) and FR-DISC-003 (interface inventory: [`walk_if_table`]);
+//! vendor profiles next.
 
 pub mod mock;
 
@@ -192,6 +193,8 @@ pub type VarBinds = Vec<(String, SnmpValue)>;
 const TAG_SEQUENCE: u8 = 0x30;
 const TAG_PDU_GETNEXT: u8 = 0xA1;
 const TAG_PDU_RESPONSE: u8 = 0xA2;
+/// GetBulkRequest PDU tag (SNMPv2c, RFC 3416 §4.2.3).
+const TAG_PDU_GETBULK: u8 = 0xA5;
 /// SNMPv2c exception tag: no successor object exists.
 const TAG_END_OF_MIB_VIEW: u8 = 0x82;
 
@@ -252,6 +255,36 @@ pub fn build_getnext_v2c(community: &str, oid: &str, request_id: i32) -> Result<
     Ok(out)
 }
 
+/// Build an SNMPv2c GetBulkRequest (PDU tag 0xA5, RFC 3416 §4.2.3) for a
+/// single `oid`. The PDU carries `non_repeaters` and `max_repetitions` in the
+/// slots that GET/GETNEXT use for error-status/error-index.
+pub fn build_getbulk_v2c(
+    community: &str,
+    oid: &str,
+    request_id: i32,
+    non_repeaters: i32,
+    max_repetitions: i32,
+) -> Result<Vec<u8>> {
+    let mut vb = enc_oid(oid)?;
+    vb.extend_from_slice(&enc_null());
+    let mut varbinds = Vec::new();
+    push_tlv(&mut varbinds, TAG_SEQUENCE, &vb); // varbind list
+
+    let mut pdu = enc_int(request_id as i64);
+    pdu.extend_from_slice(&enc_int(non_repeaters as i64)); // non-repeaters
+    pdu.extend_from_slice(&enc_int(max_repetitions as i64)); // max-repetitions
+    push_tlv(&mut pdu, TAG_SEQUENCE, &varbinds);
+    let mut wrapped = Vec::new();
+    push_tlv(&mut wrapped, TAG_PDU_GETBULK, &pdu); // GetBulkRequest context tag
+
+    let mut msg = enc_int(1); // SNMPv2c
+    msg.extend_from_slice(&enc_octet(community.as_bytes()));
+    msg.extend_from_slice(&wrapped);
+    let mut out = Vec::new();
+    push_tlv(&mut out, TAG_SEQUENCE, &msg);
+    Ok(out)
+}
+
 /// Build a RESPONSE PDU carrying `varbinds` (used by the mock test agent and
 /// useful for simulator tooling).
 pub fn build_response_v2c(
@@ -287,17 +320,25 @@ pub fn build_response_v2c(
 }
 
 /// A decoded SNMP message: request id, error status, raw PDU tag
-/// (`0xA0` GET, `0xA1` GETNEXT, `0xA2` RESPONSE, ...) and varbinds.
+/// (`0xA0` GET, `0xA1` GETNEXT, `0xA2` RESPONSE, `0xA5` GETBULK, ...) and
+/// varbinds. For GetBulkRequest PDUs the `non_repeaters` / `max_repetitions`
+/// fields carry the bulk parameters (they reuse the error-status /
+/// error-index wire slots per RFC 3416 §4.2.3); for all other PDUs they
+/// mirror `error_status` / the error-index value.
 #[derive(Debug, Clone)]
 pub struct SnmpMessage {
     pub request_id: i32,
     pub error_status: i16,
+    pub non_repeaters: i16,
+    pub max_repetitions: i16,
     pub pdu_tag: u8,
     pub varbinds: VarBinds,
 }
 
 /// Parse any SNMP message (request or response) into its parts. The mock test
-/// agent uses this to serve GET and GETNEXT from the same loop.
+/// agent uses this to serve GET, GETNEXT and GETBULK from the same loop;
+/// responses with repeated varbinds (bulk semantics) decode like any other
+/// varbind list.
 pub fn parse_message(buf: &[u8]) -> Result<SnmpMessage> {
     let mut top = Reader { b: buf, pos: 0 };
     let msg = top.tlv(TAG_SEQUENCE)?;
@@ -312,7 +353,7 @@ pub fn parse_message(buf: &[u8]) -> Result<SnmpMessage> {
     let mut pr = Reader { b: pdu, pos: 0 };
     let req_id = dec_int(pr.tlv(0x02)?)? as i32;
     let err_status = dec_int(pr.tlv(0x02)?)? as i16;
-    let _err_index = dec_int(pr.tlv(0x02)?)?;
+    let err_index = dec_int(pr.tlv(0x02)?)? as i16;
     let mut vbs = Reader { b: pr.tlv(TAG_SEQUENCE)?, pos: 0 };
 
     let mut out = Vec::new();
@@ -343,7 +384,14 @@ pub fn parse_message(buf: &[u8]) -> Result<SnmpMessage> {
             }
         }
     }
-    Ok(SnmpMessage { request_id: req_id, error_status: err_status, pdu_tag, varbinds: out })
+    Ok(SnmpMessage {
+        request_id: req_id,
+        error_status: err_status,
+        non_repeaters: err_status,
+        max_repetitions: err_index,
+        pdu_tag,
+        varbinds: out,
+    })
 }
 
 /// Parse a RESPONSE message into (request_id, error_status, varbinds).
@@ -376,6 +424,66 @@ pub fn get(
         bail!("snmp error-status {err}");
     }
     Ok(vbs)
+}
+
+/// Safety cap so a misbehaving agent cannot keep [`getbulk`] iterating
+/// forever; far above any real MIB-II subtree size.
+const GETBULK_MAX_VARS: usize = 65_535;
+
+/// Walk `root_oid` with repeated SNMPv2c GETBULK (FR-PRF-003): each round asks
+/// for up to `max_repetitions` lexicographic successors of the cursor.
+/// Traversal stops when the agent leaves the subtree, reports `endOfMibView`,
+/// fails to advance (non-monotonic guard), an empty batch arrives, or
+/// [`GETBULK_MAX_VARS`] varbinds were collected. Fresh UDP socket per request —
+/// same Windows WSAECONNRESET rationale as `engine::snmpprobe`.
+pub fn getbulk(
+    target: SocketAddr,
+    community: &str,
+    root_oid: &str,
+    timeout_ms: u64,
+    request_id: i32,
+    max_repetitions: i32,
+) -> Result<VarBinds> {
+    let root = parse_arcs(root_oid)?;
+    let mut out = Vec::new();
+    let mut cursor = root_oid.to_string();
+    while out.len() < GETBULK_MAX_VARS {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        sock.connect(target)?;
+        sock.set_read_timeout(Some(Duration::from_millis(timeout_ms)))?;
+        let rid = request_id.wrapping_add(out.len() as i32);
+        let req = build_getbulk_v2c(community, &cursor, rid, 0, max_repetitions)?;
+        sock.send(&req)?;
+        let mut buf = [0u8; 65535];
+        let n = sock.recv(&mut buf)?;
+        let msg = parse_message(&buf[..n])?;
+        if msg.request_id != rid {
+            bail!("request id mismatch");
+        }
+        if msg.error_status != 0 {
+            bail!("snmp error-status {}", msg.error_status);
+        }
+        if msg.varbinds.is_empty() {
+            break;
+        }
+        let mut done = false;
+        for (oid, val) in msg.varbinds {
+            if val == SnmpValue::EndOfMibView || !within_subtree(&root, &oid) {
+                done = true;
+                break;
+            }
+            if cmp_oid(&oid, &cursor) != Ordering::Greater {
+                done = true; // non-monotonic agent: never loop forever
+                break;
+            }
+            cursor = oid.clone();
+            out.push((oid, val));
+        }
+        if done {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 // ------------------------------------------------------------------ walk
@@ -808,5 +916,133 @@ mod tests {
         let n = sock.recv(&mut buf).unwrap();
         let m = parse_message(&buf[..n]).unwrap();
         assert_eq!(m.varbinds[0].1, SnmpValue::EndOfMibView);
+    }
+
+    // -------------------------------------------------- GETBULK fixtures
+
+    /// Wire fixture (rule: every codec change asserts exact bytes):
+    /// v2c GetBulkRequest for `1.3.6.1.2.1.2.2.1`, request-id 7,
+    /// non-repeaters 0, max-repetitions 10 (PDU tag 0xA5).
+    #[test]
+    fn getbulk_wire_fixture() {
+        let bytes = build_getbulk_v2c("public", "1.3.6.1.2.1.2.2.1", 7, 0, 10).unwrap();
+        let expected: Vec<u8> = vec![
+            0x30, 0x26, // SEQUENCE, msg len 38
+            0x02, 0x01, 0x01, // version 2c
+            0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', // community
+            0xa5, 0x19, // GetBulkRequest PDU, len 25
+            0x02, 0x01, 0x07, // request-id 7
+            0x02, 0x01, 0x00, // non-repeaters 0
+            0x02, 0x01, 0x0a, // max-repetitions 10
+            0x30, 0x0e, // varbind list, len 14
+            0x30, 0x0c, // varbind, len 12
+            0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x02, 0x02, 0x01, // OID
+            0x05, 0x00, // NULL value
+        ];
+        assert_eq!(bytes, expected);
+        let m = parse_message(&bytes).unwrap();
+        assert_eq!(m.pdu_tag, TAG_PDU_GETBULK);
+        assert_eq!(m.request_id, 7);
+        assert_eq!(m.non_repeaters, 0);
+        assert_eq!(m.max_repetitions, 10);
+        assert_eq!(
+            m.varbinds,
+            vec![("1.3.6.1.2.1.2.2.1".to_string(), SnmpValue::Null)]
+        );
+    }
+
+    /// Mock agent serves GETBULK: up to `max_repetitions` lexicographic
+    /// successors per repeated varbind, echoing the request id, with
+    /// `endOfMibView` filling past the end of the varbind table and
+    /// `non_repeaters` varbinds behaving like GETNEXT.
+    #[test]
+    fn mock_getbulk_caps_at_max_repetitions_then_end_of_mib_view() {
+        let a = mock::spawn("public", if_table_fixture()).unwrap();
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut buf = [0u8; 1500];
+
+        // Ten repetitions from the ifName root cross into the ifHighSpeed
+        // column (global lexicographic order) then exhaust the MIB: the
+        // response holds exactly max_repetitions varbinds.
+        let req = build_getbulk_v2c("public", COL_IF_NAME, 55, 0, 10).unwrap();
+        sock.send_to(&req, a.addr).unwrap();
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        let m = parse_message(&buf[..n]).unwrap();
+        assert_eq!(m.pdu_tag, TAG_PDU_RESPONSE);
+        assert_eq!(m.request_id, 55);
+        assert_eq!(m.varbinds.len(), 10); // repetition cap enforced
+        assert_eq!(
+            m.varbinds[0],
+            (format!("{COL_IF_NAME}.1"), SnmpValue::Str(b"eth0".to_vec()))
+        );
+        assert_eq!(m.varbinds[1].0, format!("{COL_IF_NAME}.2"));
+        assert_eq!(m.varbinds[2].0, format!("{COL_IF_HIGH_SPEED}.1"));
+        assert_eq!(
+            m.varbinds[3],
+            (format!("{COL_IF_HIGH_SPEED}.2"), SnmpValue::Int(100))
+        );
+        assert!(m.varbinds[4..].iter().all(|(_, v)| *v == SnmpValue::EndOfMibView));
+
+        // Starting at the lexicographically last key, every repetition is
+        // endOfMibView.
+        let req =
+            build_getbulk_v2c("public", &format!("{COL_IF_HIGH_SPEED}.2"), 56, 0, 3).unwrap();
+        sock.send_to(&req, a.addr).unwrap();
+        let n = sock.recv(&mut buf).unwrap();
+        let m = parse_message(&buf[..n]).unwrap();
+        assert_eq!(m.request_id, 56);
+        assert_eq!(m.varbinds.len(), 3);
+        assert!(m.varbinds.iter().all(|(_, v)| *v == SnmpValue::EndOfMibView));
+
+        // non_repeaters = 1: the sole varbind gets ONE successor instead of a
+        // repetition chain.
+        let req = build_getbulk_v2c("public", COL_IF_NAME, 57, 1, 4).unwrap();
+        sock.send_to(&req, a.addr).unwrap();
+        let n = sock.recv(&mut buf).unwrap();
+        let m = parse_message(&buf[..n]).unwrap();
+        assert_eq!(m.request_id, 57);
+        // The response carries exactly ONE varbind (a GETNEXT-style single
+        // successor), proving the agent honored non_repeaters instead of
+        // returning the 4-repetition chain.
+        assert_eq!(m.varbinds.len(), 1);
+        assert_eq!(m.varbinds[0].0, format!("{COL_IF_NAME}.1"));
+    }
+
+    /// Client wrapper: GETBULK walk covers the whole ifTable column family in
+    /// batches and matches the GETNEXT [`walk`] result exactly.
+    #[test]
+    fn getbulk_walk_matches_getnext_walk() {
+        let a = mock::spawn("public", if_table_fixture()).unwrap();
+        let bulk = getbulk(a.addr, "public", "1.3.6.1.2.1.2.2.1", 500, 900, 3).unwrap();
+        let next = walk(a.addr, "public", "1.3.6.1.2.1.2.2.1", 500, 100).unwrap();
+        assert_eq!(bulk, next);
+        assert_eq!(bulk.len(), 8);
+    }
+
+    /// Client wrapper roundtrip vs mock: traversal exits the requested column
+    /// subtree mid-batch (out-of-subtree successors are discarded) and small
+    /// repetition caps only mean more rounds — never lost or extra rows.
+    #[test]
+    fn getbulk_subtree_exit_and_repetition_cap_roundtrip() {
+        let a = mock::spawn("public", if_table_fixture()).unwrap();
+
+        // Each batch would return up to 10 successors spanning several
+        // columns; only the 2 admin-status rows may be kept.
+        let rows = getbulk(a.addr, "public", COL_IF_ADMIN_STATUS, 500, 70, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|(o, _)| o.starts_with(&format!("{COL_IF_ADMIN_STATUS}."))));
+
+        // Cap of one repetition degenerates to GETNEXT-per-round yet still
+        // yields the complete subtree.
+        let rows = getbulk(a.addr, "public", COL_IF_NAME, 500, 71, 1).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (format!("{COL_IF_NAME}.1"), SnmpValue::Str(b"eth0".to_vec())),
+                (format!("{COL_IF_NAME}.2"), SnmpValue::Str(b"eth1".to_vec())),
+            ]
+        );
     }
 }
