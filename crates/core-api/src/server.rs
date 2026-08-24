@@ -321,6 +321,12 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
             let saved = query_param(query, "saved").as_deref() == Some("1");
             html("200 OK", crate::ui::settings_page(&shared.store.lock(), saved))
         }
+        ("GET", "/triage") => {
+            let Some(ip) = query_param(query, "ip").filter(|s| !s.is_empty()) else {
+                return text("400 Bad Request", "query parameter ip is required".into());
+            };
+            html("200 OK", crate::ui::triage_page(&shared.store.lock(), &url_decode(&ip)))
+        }
         ("GET", "/reports") => {
             let hours: i64 = query_param(query, "hours")
                 .and_then(|h| h.parse().ok())

@@ -544,6 +544,174 @@ fn svg_timeline(segs: &[db::Segment], start: i64, end: i64) -> String {
     out
 }
 
+// ------------------------------------------------------------------- triage
+
+/// NetBrain-style one-click diagnosis: everything relevant to a suspected
+/// fault on one screen (FR-UX-005 v0).
+pub fn triage_page(conn: &Connection, ip: &str) -> String {
+    let Some(d) = db::device_by_ip(conn, ip).ok().flatten() else {
+        return page(conn, "Unknown device", "", "<h2>unknown device</h2>");
+    };
+    let now = chrono::Utc::now().timestamp();
+
+    // Root cause chain: walk parents while they are down/unreachable.
+    let mut chain = vec![format!("<b class=\"mono\">{}</b> {}", d.ip, badge(&d.eff_state))];
+    let mut cursor = d.parent_id;
+    let mut guard = 0;
+    while let Some(pid) = cursor {
+        guard += 1;
+        if guard > 8 {
+            break;
+        }
+        match db::device_by_id(conn, pid).ok().flatten() {
+            Some(p) => {
+                chain.push(format!(
+                    "&uarr; <a href=\"/device/{}\">{}</a> {} ({})",
+                    p.ip,
+                    p.ip,
+                    badge(&p.eff_state),
+                    esc(&db::site_name(conn, p.site_id))
+                ));
+                cursor = p.parent_id;
+            }
+            None => break,
+        }
+    }
+
+    // probable root: nearest ancestor that is down, else this device itself
+    let _root_ip = {
+        let mut cur = Some(d.id);
+        let mut found = None;
+        let mut hops = 0;
+        while let Some(id) = cur {
+            hops += 1;
+            if hops > 8 {
+                break;
+            }
+            if let Ok(Some(p)) = db::device_by_id(conn, id) {
+                let parent = p.parent_id;
+                if matches!(p.eff_state.as_str(), "down" | "unreachable") {
+                    found = Some(p);
+                }
+                cur = if found.is_some() { None } else { parent };
+            } else {
+                break;
+            }
+        }
+        found.map(|p| p.ip).unwrap_or_else(|| d.ip.clone())
+    };
+
+    // dependents impacted by this device
+    let children: Vec<String> = conn
+        .prepare("SELECT ip FROM devices WHERE parent_id=?1 ORDER BY ip LIMIT 500")
+        .and_then(|mut s| {
+            s.query_map(rusqlite::params![d.id], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+
+    let series = db::recent_rtt_series(conn, d.id, 120).unwrap_or_default();
+    let spark: Vec<(i64, f64)> =
+        series.iter().filter_map(|(t, r)| r.map(|v| (*t, v))).collect();
+    let segs = db::segments_window(conn, d.id, now - 6 * 3600, 200).unwrap_or_default();
+    let evs = db::list_events(conn, false, None, Some(d.id), 0, 10).unwrap_or_default();
+    let diag = db::latest_diag(conn, d.id).ok().flatten();
+
+    let mut body = format!(
+        "<h2>Triage \u{2014} <span class=\"mono\">{ip}</span></h2>\
+<div class=\"panel\" style=\"margin-bottom:14px\"><h2>Causal chain (this device &rarr; network root)</h2><div>{}</div></div>",
+        chain.join("<br>")
+    );
+
+    // impact
+    if !children.is_empty() {
+        let mut list = String::new();
+        for c in &children {
+            let _ = write!(list, "<a href=\"/device/{c}\">{c}</a> ");
+        }
+        let _ = write!(
+            body,
+            "<div class=\"panel\" style=\"margin-bottom:14px\"><h2>Depends on this device ({})</h2>{list}</div>",
+            children.len()
+        );
+    }
+
+    // charts + events side by side
+    let chart = svg_line(&spark, 600, 110, "var(--info)", "ms");
+    let timeline = svg_timeline(&segs, now - 6 * 3600, now);
+    let _ = write!(
+        body,
+        "<div class=\"grid2\"><div class=\"panel\"><h2>RTT (recent)</h2>{chart}</div>\
+<div class=\"panel\"><h2>State timeline \u{2014} 6h</h2>{timeline}</div></div>"
+    );
+
+    // latest stored diagnostics summary if any
+    if let Some(dg) = &diag {
+        let _ = write!(
+            body,
+            "<div class=\"panel\" style=\"margin:10px 0\"><h2>Last diagnostics</h2><span class=\"muted\">{}</span> \
+score {} ({}) · loss {:.0}% · ports {}</div>",
+            ago(dg.get("ts").and_then(|v| v.as_i64()).unwrap_or(0)),
+            dg.get("score").and_then(|v| v.as_i64()).unwrap_or(-1),
+            esc(dg.get("verdict").and_then(|v| v.as_str()).unwrap_or("?")),
+            dg.get("loss_pct").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            esc(dg.get("open_ports").and_then(|v| v.as_str()).unwrap_or("-"))
+        );
+    }
+
+    let _ = write!(
+        body,
+        "<div class=\"panel\" style=\"margin:10px 0\"><h2>Run now</h2>\
+<button onclick=\"runDiag('{ip}')\">Diagnostics</button> &nbsp;\
+<button onclick=\"tracePath('{ip}')\">Trace path</button> &nbsp;\
+<button onclick=\"ackAll('{ip}')\">Acknowledge open alerts</button>\
+<div id=\"out\" class=\"muted\" style=\"margin-top:8px\"></div></div>\
+<script>
+const e = s => {{ const d=document.createElement('div'); d.textContent=String(s); return d.innerHTML; }};
+const f1 = v => v==null ? '-' : Number(v).toFixed(1);
+async function runDiag(ip) {{
+  const el=document.getElementById('out'); el.textContent='running…';
+  try {{
+    const r=await fetch('/api/diagnose?ip='+encodeURIComponent(ip),{{method:'POST'}});
+    const d=await r.json(); if(!r.ok) throw new Error(d.error||r.status);
+    el.innerHTML='<b>'+d.diag.score+'/100 ('+d.diag.verdict+')</b> loss '+d.diag.loss_pct.toFixed(0)+
+      '% avg '+f1(d.diag.rtt_avg)+'ms class '+e(d.device_class);
+  }} catch(err) {{ el.textContent='failed: '+err.message; }}
+}}
+async function tracePath(ip) {{
+  const el=document.getElementById('out'); el.textContent='tracing…';
+  try {{
+    const r=await fetch('/api/trace?ip='+encodeURIComponent(ip),{{method:'POST'}});
+    const d=await r.json(); if(!r.ok) throw new Error(d.error||r.status);
+    el.innerHTML=d.hops.map(h=>h.ttl+': '+(h.reached?'<b>':'')+e(h.ip||'*')+
+      (h.reached?'</b>':'')+' '+f1(h.rtt_ms)+'ms').join('<br>');
+  }} catch(err) {{ el.textContent='failed: '+err.message; }}
+}}
+async function ackAll(ip) {{
+  try {{
+    const list=await (await fetch('/events?view=open&ip='+encodeURIComponent(ip))).text();
+    el_text='use Events page to acknowledge individually';
+    document.getElementById('out').textContent=el_text;
+  }} catch(err) {{ document.getElementById('out').textContent='failed'; }}
+}}
+</script>",
+        ip = esc(ip)
+    );
+
+    // recent events table
+    body.push_str("<h3>Recent events for this device</h3><table><tr><th>when</th><th>sev</th><th>kind</th><th>message</th><th>state</th></tr>");
+    for e in &evs {
+        let st = if e.state == "open" { badge("open") } else { closed_badge().to_string() };
+        let _ = write!(
+            body,
+            "<tr><td class=\"muted\">{}</td><td>{}</td><td class=\"mono\">{}</td><td>{}</td><td>{st}</td></tr>",
+            ago(e.created_ts), badge(&e.severity), esc(&e.kind), esc(&e.message)
+        );
+    }
+    body.push_str("</table>");
+    page(conn, &format!("Triage {ip}"), "", &body)
+}
+
 // ------------------------------------------------------------------- events
 
 pub fn events_page(conn: &Connection, only_open: bool, severity: Option<&str>) -> String {
