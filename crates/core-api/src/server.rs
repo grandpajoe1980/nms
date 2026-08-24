@@ -350,6 +350,10 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
         ("POST", "/api/trace") => trace_endpoint(query, shared),
         ("GET", "/api/health") => health_endpoint(shared),
         ("GET", "/api/openapi.json") => json("200 OK", openapi_spec()),
+        ("GET", "/metrics") => text(
+            "200 OK",
+            engine::metrics::render(&shared.store.lock()),
+        ),
         ("GET", "/login") => login_page(None),
         ("POST", "/login") => {
             let username = form_value(body, "username").unwrap_or_default();
@@ -798,6 +802,7 @@ pub const API_ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/api/status", "Job state, revision, progress and last cycle stats"),
     ("GET", "/api/health", "Component health: database, scheduler, webhook queue"),
     ("GET", "/api/openapi.json", "This OpenAPI 3.0 document"),
+    ("GET", "/metrics", "Prometheus text-format exposition of platform gauges"),
     ("GET", "/api/model", "Current discovered topology model.json"),
     ("GET", "/api/dashboard.json", "Dashboard aggregates: counts, trend, worst latency, event counters"),
     ("GET", "/api/device/{ip}.json", "One inventory device record"),

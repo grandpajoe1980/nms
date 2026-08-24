@@ -9,6 +9,7 @@ pub mod diag;
 pub mod discover;
 pub mod engine;
 pub mod jobs;
+pub mod metrics;
 pub mod model;
 pub mod monitor;
 pub mod netutil;
