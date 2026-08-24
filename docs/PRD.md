@@ -1,13 +1,21 @@
 # PRD — Open-Source Network Management Platform ("nms-ng")
 
-**Version:** 1.0 · **Status:** Approved for build · **Audience:** AI programmers / implementers
+**Version:** 1.1 · **Status:** Approved for build · **Audience:** AI programmers / implementers
 **Goal:** Clean-sheet rebuild of *Infosim StableNet* (unified fault/performance/config/inventory management) and *NetBrain* (network context model: Device–Topology–Path–Intent, runbooks, triggered diagnostics) as one **free, open-source platform**, better than both.
-**Reference deployment target:** 850 sites · ~3,000 routers · ~50,000 endpoints · detection-to-notification ≤ 2 minutes.
+**Reference deployment target:** 850 sites · ~3,000 routers · ~50,000 endpoints · detection-to-notification ≤ 2 minutes (Enterprise tier; see §7 scale tiers).
 
 > **How to read this document.** Every requirement has an ID (`FR-<DOMAIN>-<nnn>`), a priority
 > (**P0** = MVP must-have, **P1** = next, **P2** = differentiator, **P3** = later), and is written to be
 > directly implementable and testable. "MVP" = Milestone M2 (§13). When this PRD conflicts with
 > marketing language of the reference products, this PRD wins.
+
+> **v1.1 changelog.** Incorporates `docs/research/2026-08-deep-research-report.md` per
+> ADR-0001: dual-track collector plane (Rust seed + Go adapters), Kafka/PostgreSQL/ClickHouse
+> scale-out defaults (SQLite+NATS stay as lab mode), three design scale tiers (§7), new domains
+> §4.15–4.20 (capture, security, cloud/K8s/mesh/microseg/zero-trust, edge, migration,
+> governance), expanded protocol matrix §5, canonical event envelope & adapter contract §6.1–6.2,
+> KPIs §16, testing program §17, migration pipeline §18, staffing/effort §19, governance §20,
+> collection strategy principles §21.
 
 ---
 
@@ -65,26 +73,61 @@ fast (single static binary), the *automation* declarative (YAML intents/runbooks
 │  Engine · RBAC/Authn (optional mode) · Web Console          │
 ├─────────────────────────────────────────────────────────────┤
 │ Data Plane                                                  │
-│  Message bus (NATS JetStream) — topics: metrics, events,    │
-│  states, topology, configs, flows, traces                   │
+│  Enterprise/Large tiers: Kafka (durable, replayable)        │
+│  Lab mode: in-process channels / embedded NATS              │
+│  Topics: metrics, events, states, topology, configs,        │
+│  flows, traces, captures                                    │
 ├──────────────┬──────────────┬───────────────────────────────┤
 │ Collector(s) │ Flow Collector│ Ingest Workers               │
-│ (Rust agent, │ (IPFIX/sFlow) │ normalize→store              │
-│  regional)   │              │                               │
+│ Rust seed    │ Go adapters   │ normalize→enrich→dedupe      │
+│ (ICMP/diag)+ │ (GoFlow2/     │ →store                       │
+│ Go protocol  │  pmacct)      │                              │
+│ adapters     │              │                               │
 └──────────────┴──────────────┴───────────────────────────────┘
 Storage tier:
-  • TSDB: VictoriaMetrics or ClickHouse (metrics, flows)
-  • Graph: embedded (initially SQLite tables → later Apache AGE/
-    Kuzu) for Device–Interface–Link–Path–Intent entities
-  • Object store (S3-compatible/local FS): configs, pcaps, reports
-  • Relational: PostgreSQL (inventory, alarms, audit) — SQLite for
-    single-binary mode
+  • Relational: PostgreSQL (inventory, alarms, audit, policy)
+    — SQLite for single-binary lab mode
+  • Analytics: ClickHouse (metrics, flows, events; materialized
+    rollups + TTL retention policies)
+  • Graph: temporal model in PostgreSQL first (recursive CTEs);
+    dedicated engine only if profiling demands it
+  • Object store (S3-compatible/local FS): configs, pcaps,
+    reports, model artifacts
+  • Optional OpenSearch for full-text/log workloads only where
+    justified; never a default sink for metrics/flows
 ```
+
+Separation of concerns is fixed: **collection → transport → normalization →
+state/modeling → analytics → action → presentation**. No collector writes its
+own bespoke schema; everything crosses the bus in the canonical envelope (§6.1).
+
+### 3.1.1 Monitoring vs observability — "progressively deep" collection
+
+Monitoring answers *known indicators vs known thresholds*; observability lets an
+operator **explain** an unexpected condition by joining telemetry with topology,
+configuration, paths, changes, dependencies and identity. The core
+differentiator is therefore a **temporal network knowledge graph plus an
+evidence-based diagnostic engine**: every entity, relationship, state and
+conclusion carries provenance (`source`, `observed_at`, `confidence`) and time
+validity. An incident must be explainable as a chain:
+
+`service degradation → path changed → BGP next-hop changed → config commit → policy difference → affected links/interfaces → corroborating latency/loss/flow evidence`
+
+Collection is **progressively deep** — cheap signals run continuously, expensive
+collection activates on evidence:
+
+`counters/state continuously → sampled/aggregated flows continuously → transaction metadata selectively → header ring-buffers at sensitive points → bounded full-packet capture only during investigations`
+
+Triggered escalation closes the loop (SpiderMon-pattern): symptom → RCA engine
+queries the graph for probable scope → targeted high-rate polling / gNMI
+subscription / flow query / optional bounded capture → evidence with provenance
+attaches to the incident → ranked hypotheses with supporting AND contradicting
+evidence go to the operator.
 
 ### 3.2 Deployment modes (all first-class)
 
 - **FR-PLAT-001 (P0) Single binary:** `nms serve` runs control plane + 1 collector + SQLite + embedded UI. Zero external services. This is today's repo behavior, kept forever as "lab mode."
-- **FR-PLAT-002 (P1) Scale-out:** collectors are separate processes/hosts registering to core; Postgres + VictoriaMetrics/ClickHouse + NATS via config file or env vars.
+- **FR-PLAT-002 (P1) Scale-out:** collectors are separate processes/hosts registering to core; PostgreSQL + ClickHouse + Kafka via config file or env vars (ADR-0001).
 - **FR-PLAT-003 (P2) HA:** active/standby core; collector fan-out to two cores; idempotent ingestion.
 - **FR-PLAT-004 (P0) Air-gap:** no telemetry home, all features work offline; optional offline docs bundled.
 
@@ -233,6 +276,42 @@ Webhook payload contract (v1, already implemented in current repo — freeze it)
 - **FR-PLAT-008 (P1)** Backup/restore: single archive command (config + DB dumps + object store manifest); documented RPO/RTO.
 - **FR-PLAT-009 (P0)** Upgrades: forward-compatible migrations, rollback-safe (never destructive without backup marker); `nms migrate status`.
 
+### 4.15 Packet Capture (CAP)
+
+- **FR-CAP-001 (P1)** Bounded on-demand capture: ring buffers, BPF filters, triggered by alarm/runbook/manual; headers-only default; hard bandwidth/disk quotas; PCAP/PCAPNG export; fails safely under overload.
+- **FR-CAP-002 (P2)** Distributed capture agents at collectors/edge; centralized job orchestration with per-agent placement.
+- **FR-CAP-003 (P1)** Capture privacy modes: `metadata-only → L2-L4 headers → app metadata → full payload`, progressively privileged; full payload never a default retention tier; retention/hold policy + audit per capture. Zeek/Suricata enrichment adapters consume live traffic or stored PCAP.
+
+### 4.16 Security Monitoring (SEC)
+
+- **FR-SEC-001 (P2)** Ingest IDS/firewall/auth findings (Zeek logs, Suricata EVE, firewall syslog) into the event pipeline; correlate with flows, topology and identity.
+- **FR-SEC-002 (P2)** East-west analytics: observed conversation matrices, segmentation-violation detection (observed vs allowed policy), first-seen destination alerts.
+- **FR-SEC-003 (P3)** Zero-trust posture reporting: identity/policy coverage of privileged paths (NIST SP 800-207 alignment); advisory only — no automatic blocking.
+
+### 4.17 Cloud, Kubernetes & Service Mesh (CLD)
+
+- **FR-CLD-001 (P2)** Cloud inventory/routes/security ingestion: AWS VPC/TGW (+ flow logs), Azure VNet/VNet flow logs, GCP VPC Flow Logs; read-only IAM; account/subscription/project discovery; incremental sync with API-throttle awareness.
+- **FR-CLD-002 (P2)** Kubernetes networking: watch nodes/pods/services/EndpointSlices/NetworkPolicies via K8s API (least-privilege SA); CNI state; optional Hubble/eBPF flow visibility; Secrets never ingested.
+- **FR-CLD-003 (P3)** Service mesh: Istio/Envoy telemetry for service graph, mTLS identity, L7 latency/retries; correlate L7 signals with L3 path/loss evidence.
+- **FR-CLD-004 (P3)** Microsegmentation analytics: normalized policy model, observed-vs-allowed matrices, reachability simulation, overbroad-policy findings — advisory mode only.
+- **FR-CLD-005 (P2)** Hybrid stitching: VPN/SD-WAN/transit/tunnel/overlay edges join physical, cloud and K8s domains in one graph with explicit confidence where correlation is inferred.
+
+### 4.18 Edge Collectors (EDGE)
+
+- **FR-EDGE-001 (P2)** Store-and-forward edge collector: local probes continue during WAN loss; compressed spool; backfill on reconnect with dedupe; bounded local storage; remote upgrade/policy.
+- **FR-EDGE-002 (P3)** MQTT 5 transport option for constrained sites; mutual identity; signed updates.
+
+### 4.19 Legacy Migration Tooling (MIG)
+
+- **FR-MIG-001 (P2)** Import/export adapters for NetBrain/NMSaaS-class exports: inventory ("inventory-of-inventory"), maps→`MapView`, intents/diagnostics→`Intent+Workflow`, golden paths→`Baseline/PathSnapshot`, integrations→connectors; every record tagged `converted|partially_converted|manual_review_required`; original exports preserved as immutable evidence.
+- **FR-MIG-002 (P2)** Dual-run support: parallel observation before parallel action; avoid double-polling sensitive devices (designate primary heavy collector, ingest the other's outputs); cutover acceptance = topology/inventory/metric/event/config-backup parity checks plus HA/restore exercise. Automation cutover lags observability: read-only diagnostics → lab prechecks → production shadow → approved low-risk writes.
+
+### 4.20 Governance & Community (GOV)
+
+- **FR-GOV-001 (P0)** DCO 1.1 for all contributions; public ADR/RFC process (this repo's `docs/adr/`).
+- **FR-GOV-002 (P3)** TSC model: architecture maintainers, subsystem maintainers, security response team, release managers, vendor SIGs; merit-based election w/ term limits as ecosystem matures.
+- **FR-GOV-003 (P0)** No feature-gated proprietary edition: HA, RBAC, multi-tenancy, security and APIs always ship in the open core.
+
 ---
 
 ## 5. Protocol Support Matrix
@@ -252,19 +331,73 @@ Webhook payload contract (v1, already implemented in current repo — freeze it)
 | TWAMP/OWAMP | advanced latency SLAs | P3 |
 | OpenTelemetry (OTLP) | metrics ingest bridge | P2 |
 | DHCP snooping/IPAM reads | endpoint tracking | P3 |
+| BMP | BGP session/RIB visibility | P1 |
+| BGP-LS | link-state/TE topology feed | P2 |
+| PCEP/PCEPS | computed/controlled TE paths | P3 |
+| MQTT 5 | constrained edge/IoT telemetry | P2 |
+| eBPF / Hubble | workload flow visibility, microsegmentation evidence | P1/P2 |
+| Kubernetes API + CNI | workloads, services, NetworkPolicy watch | P1 |
+| Cloud APIs + flow logs (AWS VPC/TGW, Azure VNet, GCP) | cloud inventory/routes/traffic | P1 |
+| Vendor REST APIs (controllers, Meraki-style) | inventory/state/events | P0 |
 
 ---
 
 ## 6. Data Architecture
 
-- **Metrics:** table-per-kind wide schema in VictoriaMetrics/ClickHouse: labels `{tenant, site, device_ip, device_id, iface, class}`; raw resolution 60 s × 36 h → 5 m × 14 d → 1 h × 400 d (config keys already exist; mirror defaults).
+- **Metrics:** ClickHouse wide tables: labels `{tenant, site, device_ip, device_id, iface, class}`; raw resolution 60 s × 36 h → 5 m × 14 d → 1 h × 400 d (config keys already exist; mirror defaults). **Rollups must retain min/max/sum/count and p95/p99 (or mergeable quantile state), not averages** — a 1-minute saturation spike must survive a 5-minute rollup.
 - **Events/alarms/audit:** relational (Postgres prod / SQLite lab), append-only event log + materialized `alarms_open` view.
-- **Graph:** start with normalized tables + recursive CTEs (sufficient to 50 k nodes); swap-in embedded graph engine behind `TopologyStore` trait when queries need variable-length paths.
+- **Graph:** temporal model in PostgreSQL first — every entity/relationship carries provenance fields `source`, `observed_at`, `valid_from`, `valid_to`, `confidence`; recursive CTEs for paths; swap-in dedicated engine behind `TopologyStore` trait only if profiling demands.
 - **Object store:** local FS with S3 adapter trait; content-addressed blobs (sha256) for configs/pcaps/reports.
-- **Schema governance:** every bus message and API object has a versioned schema (`schema.v1.*`); breaking changes bump topic/schema name — never mutate in place.
-- **Idempotency:** producers attach `(source, seq)` dedupe keys; storage upserts.
+- **Schema governance:** every bus message and API object has a versioned schema (`schema.v1.*`); breaking changes bump topic/schema name — never mutate in place. Keep raw/minimally-normalized streams for a bounded window so reprocessing after schema evolution is possible.
+- **Idempotency:** producers attach `(source, seq)` dedupe keys; storage upserts. Every record distinguishes `observed_at` from `ingested_at`; collectors report clock-sync health so RCA can reason over skew windows.
+- **Cardinality is a budget:** every telemetry schema declares estimated cardinality, allowed dimensions, retention class and aggregation behavior; high-cardinality facts live in analytical tables, never as per-combination series.
 
-## 7. Scale & Performance NFRs (reference estate: 850 sites / 3 k routers / 50 k endpoints)
+### 6.1 Canonical event envelope (v1)
+
+Semantic model shared across all transports; wire format may be Protobuf where JSON overhead is unacceptable.
+
+```json
+{
+  "schema": "network.telemetry.v1",
+  "tenant_id": "t-123",
+  "source": { "collector_id": "col-17", "protocol": "gnmi", "device_id": "dev-456" },
+  "observed_at": "2026-08-24T14:03:17.123456Z",
+  "ingested_at": "2026-08-24T14:03:17.231991Z",
+  "sequence": 9817261,
+  "kind": "interface.counter",
+  "entity": { "type": "interface", "id": "if-789" },
+  "payload": { "name": "in_octets", "value": 19482736192, "unit": "bytes" },
+  "quality": { "counter_reset": false, "confidence": 1.0 }
+}
+```
+
+### 6.2 Device adapter contract
+
+Adapters expose **capabilities**, not vendor methods. Every method returns
+canonical structures plus `raw_source` references and a capability declaration;
+a device that cannot do atomic config replacement must say so.
+
+```
+get_inventory() get_interfaces() get_neighbors() get_routes()
+get_bgp_state() get_config() get_environment()
+subscribe(paths)
+validate_config(candidate) diff_config(candidate)
+stage_config(candidate) commit() rollback()
+run_command(read_only_command)
+```
+
+## 7. Scale & Performance NFRs
+
+**Design/test tiers** (PRD targets, not measured promises):
+
+| Tier | Planning target | Deployment |
+|---|---|---|
+| Community | ≤1 k devices · ≤50 k interfaces · ~10 k samples/s | single server / small HA |
+| Enterprise | ≈10 k devices · ≈500 k interfaces · ~100 k samples/s + flows | distributed on-prem/private cloud |
+| Large/MSP | ≈100 k devices · millions of interfaces · ~1 M samples/s | sharded multi-cluster |
+
+The program's named reference estate (850 sites / 3 k routers / 50 k endpoints)
+sits in the Enterprise tier.
 
 | ID | Requirement |
 |---|---|
@@ -272,12 +405,14 @@ Webhook payload contract (v1, already implemented in current repo — freeze it)
 | NFR-02 | Detection-to-alarm ≤ 120 s for down transitions (incl. confirm probe). |
 | NFR-03 | Alarm/notification dispatch latency ≤ 5 s after decision (p99). |
 | NFR-04 | Console dashboard p95 server render ≤ 300 ms; device page ≤ 500 ms @ 50 k devices. |
-| NFR-05 | Ingest sustain 100 k metrics/s single core-node (VictoriaMetrics-class) without loss. |
+| NFR-05 | Ingest sustain 100 k metrics/s per core-node via ClickHouse pipeline without loss. |
 | NFR-06 | Collector memory ≤ 512 MB RSS at 50 k targets (single binary lab mode ≤ 128 MB). |
 | NFR-07 | Storage ≤ 250 GB/year for reference estate at default retention tiers. |
-| NFR-08 | Core restart recovery ≤ 30 s; collectors buffer ≥ 15 min of results offline (spool-on-disk). |
+| NFR-08 | Core restart recovery ≤ 30 s; collectors buffer ≥ 15 min of results offline (spool-on-disk); edge collectors store-and-forward with bounded local storage. |
 | NFR-09 | Zero data loss on graceful shutdown; at-least-once with dedupe everywhere. |
 | NFR-10 | All long jobs expose progress (0–100 %) via API within 1 s of start. |
+| NFR-11 | Backpressure is a feature: bounded queues + priority shedding during storms — order: control/audit & config transactions > alerts/state transitions > high-priority streaming state > ordinary counters > raw flows > optional deep enrichment. |
+| NFR-12 | HA targets (same-region): RPO < 1 min critical state, RTO < 15 min; DR default RPO ≤ 15 min / RTO ≤ 4 h, policy-configurable. |
 
 ## 8. Quality Attributes
 
@@ -287,22 +422,35 @@ Webhook payload contract (v1, already implemented in current repo — freeze it)
 - **Portability:** Linux (glibc+musl static), Windows (collector + lab core), macOS (lab). ARM64 builds.
 - **i18n/l10n:** UTF-8 everywhere; date/number formatting locale-aware (P2).
 
-## 9. Technology Choices (recommended, arguable per module)
+## 9. Technology Choices (v1.1 — dual-track per ADR-0001)
 
-| Layer | Choice | Why |
-|---|---|---|
-| Collector/engine | **Rust** (existing codebase seed) | perf + safety, single static binary, low-memory sweep at scale |
-| Control plane API | Rust (axum) initially; isolate behind OpenAPI | one-language velocity now; split later along trait seams |
-| Flow/streaming workers | Go or Rust | ecosystem libs (goflow/gNMI) mature |
-| Web console | TypeScript + SvelteKit (or React) | fast, small bundle; API-first means replaceable |
-| Metrics store | VictoriaMetrics (default), ClickHouse (flows/aggregation) | proven at our scale, OSS licenses OK |
-| Bus | NATS JetStream | lightweight, exactly-once-ish, clustering |
-| Relational | PostgreSQL; SQLite embedded mode | same SQL, two runtimes |
-| Graph | SQL CTEs → Kuzu/Apache AGE behind trait | defer until needed |
-| Plugin sandbox | WASM (wasmtime) | safe third-party check/alert/normalize plugins |
-| ML/AIOps | Python sidecar (optional) exposing gRPC; local models (ONNX runtime) | keep core dependency-free |
+| Layer | Default | Alternatives / reuse | Trade-off |
+|---|---|---|---|
+| Sweep/diagnostic engine (seed) | **Rust** (existing codebase) | — | perf + safety, single static binary lab mode |
+| Protocol adapters (SNMP, gNMI, config drivers) | **Go** preferred for new adapters | Rust where packet-level perf dominates; Python for slow adapters | Go networking ecosystem velocity; per-component ADR decides |
+| gNMI/OpenConfig | **gNMIc** reuse/integration initially | native client later | Apache-2.0, Capabilities/Get/Set/Subscribe |
+| CLI/config automation | **scrapli + Nornir/NAPALM** adapters | Ansible collections | unified multivendor methods; capability modeling |
+| Flow collector | **GoFlow2**; pmacct where richer integration needed | OpenNMS telemetry components | lean high-volume NetFlow/IPFIX/sFlow normalization |
+| Packet/NDR enrichment | **Zeek + Suricata** adapters | eBPF/XDP custom agents | transaction metadata + IDS without building an IDS |
+| Network verification | **Batfish** service | custom path engine later | modeled reachability/diff vs observed state |
+| Source-of-truth interop | canonical model + **NetBox import/sync** | Nautobot | optional SoT without forcing one inventory model |
+| Config archive | native object-store snapshots + diffs; optional **Oxidized** bridge | RANCID-style | broad NOS coverage early |
+| Control plane API | Rust (axum) now; isolate behind OpenAPI | split later along trait seams | one-language velocity today |
+| Web console | TypeScript + SvelteKit (or React) | Grafana embeds for ad-hoc charts | incident/topology UX stays native |
+| Metrics/flows analytics | **ClickHouse** | Prometheus+Thanos for Prometheus-semantics needs | materialized rollups + TTL fit retention tiers |
+| Bus | **Kafka** (Enterprise/Large); in-process/NATS (lab) | Redpanda-compatible ops | durable replay enables reprocessing after schema evolution |
+| Relational | PostgreSQL; SQLite embedded mode | — | recursive SQL, row-level security, JSONB |
+| Full-text search | Optional OpenSearch | ClickHouse text filtering | only when a workload justifies another cluster |
+| Identity | Keycloak-compatible OIDC/OAuth2/SAML | direct enterprise IdP | federation + MFA out of scope of core |
+| Authorization policy | app RBAC + **OPA** for ABAC | native-only | policy-as-code for network-specific decisions |
+| Secrets | **OpenBao** references | cloud KMS/vault | secrets never in configs/logs/prompt payloads |
+| Self-observability | OpenTelemetry Collector + Prometheus | — | vendor-neutral pipeline, standard metrics model |
+| Plugin sandbox | out-of-process gRPC contract first | WASM (wasmtime) for constrained extensions | isolation + language freedom over in-proc risk |
+| ML/AIOps | Python sidecar (gRPC), interpretable stats first | ONNX local models | evidence-grounded AI; graceful no-LLM mode |
 
-**License:** Apache-2.0 (core). Keep vendor drivers/plugins loadable under other licenses; never link GPL into core binaries.
+**License:** Apache-2.0 core + DCO 1.1 contributions; SPDX metadata and dependency-license CI gate; never link GPL into core binaries. HA/RBAC/multi-tenancy/APIs are never proprietary editions.
+
+**Compatibility targets & comparative suites:** OpenNMS/LibreNMS/Zabbix (polling/alarm edge cases as test baselines), NetBox (SoT model), Oxidized, SuzieQ (state normalization precedent), Batfish (verification), NetBrain (context model, Path Doctor), Kentik (flow+synthetic fusion). Each supported vendor/NOS release gets a machine-readable compatibility matrix: `discover / poll / inventory / topology / config-read / config-write / gNMI / flows / routing / tested-version / last-certified`.
 
 **OSS to study/borrow ideas (not code unless license-compatible):** LibreNMS (poller layout, device groups), Zabbix (item/trigger model), Observium (portability of vendor profiles), Oxidized/RANCID (config backup UX), Netdisco (ARP/FDB topology), ntopng (flow views), Telegraf (input plugin surface), Prometheus/Alertmanager (alert semantics), Grafana (dashboard ergonomics), NetBrain (context model, runbooks, Path Doctor concept), Kentik (flow+synthetic fusion).
 
@@ -356,18 +504,25 @@ Migration note: current repo modules map — `db.rs→stores/sqlite`, `ops.rs/ch
 - AC-NFR-01: 50 000 synthetic targets (loopback ranges) swept in ≤ 90 s with progress API reporting monotonic %.
 - AC-CFG-002: Cisco IOS-XE + Aruba AOS-CX simulators: nightly backup stored, change detected within 5 min, diff rendered, audit entries present.
 - AC-INT-001: Removing a WAN uplink on a branch sim fires `intent_violation(redundancy)` within one evaluation cycle; dashboard site card shows red intent badge.
+- AC-CAP-001: Triggered capture during a simulated flap stores headers-only PCAP under quota with audit record and privacy-mode metadata; payload capture requires elevated role.
+- AC-CLD-001: AWS sandbox account sync produces VPC/route-graph nodes with provenance within one incremental cycle; flow-log records join existing conversations by tuple+time window.
+- AC-MIG-001: Sample NetBrain export imports with per-record conversion tags and zero silent drops; reconciliation report lists unmatched objects.
 
 ## 13. Milestones
 
-| M | Theme | Contents |
-|---|---|---|
-| **M0 (done)** | Seed | ICMP discover/check/monitor/map/console, SQLite ops store, events/audit/outbound webhooks, profiling, diagnostics, trace, removal/retirement (current repo ≈ v0.2) |
-| **M1** | Hardening | Split crates per §11; OpenAPI spec; auth modes; spool-on-disk collectors; health endpoint; fixture-based tests; ServiceNow integration GA |
-| **M2 = MVP** | StableNet core parity | + SNMP v2c/v3 polling & interface inventory; LLDP/CDP topology; config backup+diff (SSH); scheduled reports PDF; triage wizard; scale test passing AC-NFR-01/02 |
-| **M3** | NetBrain context | Graph-backed topology; L2 path computation; diagnostic bundles/runbooks (read-only); intents v1 + violation alarms; map time-travel |
-| **M4** | Flows + streaming | IPFIX/sFlow ingest & views; gNMI ingest; utilization golden signals; capacity forecasts |
-| **M5** | Automation + AI | Write-guarded remediation; no-code runbook builder; baselines/anomaly scoring; NL assistant (local-model option); multi-tenant |
-| **M6** | Ecosystem | WASM plugin SDK; Grafana recipe/plugin; HA mode; TWAMP; wireless controllers |
+| M | Theme | Contents | Research-stage mapping (§19) |
+|---|---|---|---|
+| **M0 (done)** | Seed | ICMP discover/check/monitor/map/console, SQLite ops store, events/audit/outbound webhooks, profiling, diagnostics, trace, removal/retirement (current repo ≈ v0.2) | — |
+| **M1** | Hardening | Split crates per §11; OpenAPI spec; auth modes; spool-on-disk collectors; health endpoint; fixture-based tests; ServiceNow integration GA | Foundation + start of Discovery alpha |
+| **M2 = MVP** | StableNet core parity | + SNMP v2c/v3 polling & interface inventory; LLDP/CDP topology; config backup+diff (SSH); scheduled reports PDF; triage wizard; scale test passing AC-NFR-01/02 | Discovery/Core NMS alpha → Enterprise beta |
+| **M3** | NetBrain context | Graph-backed topology (temporal/provenance model §6); L2 path computation; diagnostic bundles/runbooks (read-only); intents v1 + violation alarms; map time-travel | Diagnostics & digital twin |
+| **M4** | Flows + streaming | IPFIX/sFlow ingest (GoFlow2) & views; gNMI ingest (gNMIc); utilization golden signals; capacity forecasts; edge collectors (FR-EDGE-001) | Enterprise beta → cloud-native start |
+| **M5** | Automation + AI | Write-guarded remediation w/ approvals; no-code runbook builder; baselines/anomaly ensemble; grounded NL assistant (local-model option); multi-tenant + RBAC via OIDC/OPA | Safe automation/compliance + AIOps start |
+| **M6** | Ecosystem & scale | Plugin contract (gRPC out-of-process; WASM optional); Grafana recipes; HA mode; TWAMP; wireless controllers; 10k-device validation, DR drills, accessibility/localization framework | Scale/security GA |
+| **M7** | Hybrid domains | Cloud/K8s/mesh/microsegmentation graph + flow logs (FR-CLD-*); security-monitoring enrichment (Zeek/Suricata); Batfish verification integration | Cloud-native/hybrid |
+| **M8** | Large-scale program | 100k-device tier sharding, BMP/BGP-LS feeds, advanced RCA ensemble, migration tooling GA (FR-MIG-*) | Advanced AIOps / very-large scale |
+
+Sequencing rules carried from research: **do not build AI before the evidence substrate**; do not build custom graph DB before profiling PostgreSQL; do not build flow decoders before evaluating GoFlow2/pmacct; do not build an IDS before integrating Zeek/Suricata; do not hand-write vendor drivers where NAPALM/scrapli already cover the interface.
 
 ## 14. Risks & Mitigations
 
@@ -382,8 +537,71 @@ Migration note: current repo modules map — `db.rs→stores/sqlite`, `ops.rs/ch
 
 ## 15. Glossary
 
-**RCA** root-cause analysis · **MTTR/MTTA** mean time to restore/acknowledge · **SLA/SLO/SLI** service level agreement/objective/indicator · **Intent** declarative assertion of desired network state · **Golden config** approved template · **DVT/DataView** NetBrain terms for contextual data/diagnostic views · **Runbook** executable diagnostic/remediation procedure · **IPFIX/sFlow** flow telemetry · **gNMI** gRPC network management interface · **TWAMP** two-way active measurement protocol.
+**RCA** root-cause analysis · **MTTR/MTTA** mean time to restore/acknowledge · **SLA/SLO/SLI** service level agreement/objective/indicator · **Intent** declarative assertion of desired network state · **Golden config** approved template · **DVT/DataView** NetBrain terms for contextual data/diagnostic views · **Runbook** executable diagnostic/remediation procedure · **IPFIX/sFlow** flow telemetry · **gNMI** gRPC network management interface · **TWAMP** two-way active measurement protocol · **BMP** BGP Monitoring Protocol · **BGP-LS** BGP Link-State distribution · **PCEP** Path Computation Element Protocol · **CNI** Container Network Interface · **SoT** source of truth.
+
+## 16. Product KPIs (operational outcomes, not vanity metrics)
+
+| KPI | Target direction |
+|---|---|
+| Discovery precision/recall | ↑ toward validated 99 %+ in certified scenarios |
+| Collection freshness/completeness | ↑ |
+| Stream/flow decode failure rate | ↓ |
+| Mean time to detect / to identify likely cause / to repair | ↓ |
+| Alerts per actionable incident | ↓ |
+| RCA top-3 precision; operator acceptance of hypotheses | ↑ |
+| False anomaly rate | ↓ |
+| Config backup freshness; change success & rollback success | ↑ |
+| Modeled-vs-observed path agreement | ↑ |
+| SLO measurement coverage | ↑ |
+| Polling/telemetry load per device at equivalent visibility | ↓ |
+| Storage cost per monitored entity | ↓ (rollups/sampling/TTL) |
+| UI incident task-completion time | ↓ |
+| Cross-tenant security defects; unauthorized automated changes; critical a11y defects | zero |
+
+## 17. Testing Program
+
+| Class | Required coverage |
+|---|---|
+| Protocol unit/fuzz | SNMP ASN.1, NetFlow/IPFIX templates, sFlow, syslog, gNMI payloads, CLI parser fuzzing, malformed inputs |
+| Golden fixtures | Recorded vendor replies per NOS/version with normalized expected output (`fixtures/`) |
+| Virtual NOS + hardware lab | boot/configure/discover/poll/stream/change/rollback; certification matrix per §9 |
+| Topology/path correctness | synthetic graphs w/ LAG/MLAG/STP/VRF/MPLS/VPN/overlays/ECMP; modeled-vs-probed agreement |
+| Scale | sustained poll/telemetry/flow/event/query loads at tier targets (§7); step-load soak to 2× nominal |
+| Chaos | collector death, broker loss, DB node loss, packet loss, WAN partitions, clock skew |
+| Security | RBAC matrix, tenant escape, API abuse (OWASP API top risks), plugin sandbox, secret leakage, SBOM/supply chain |
+| Automation safety | dry-run, approvals, partial commit, lost connectivity, rollback, split-brain |
+| ML/RCA | labeled incident corpus, false-correlation tests, drift, evidence-grounding checks |
+| UX/accessibility | operator task scenarios, keyboard/screen-reader, large-topology workflows; WCAG 2.2 AA as release criterion |
+| Upgrade/DR | rolling upgrades, migration windows, restore-from-backup drills (quarterly) |
+
+## 18. Migration Pipeline (from NetBrain / NMSaaS-class systems)
+
+`export/API adapters → staging canonical model → validation/reconciliation → open NMS read-only → dual-run monitoring → shadow diagnostics → approved write automation → cutover → legacy archive`
+
+Requirements: FR-MIG-001/002. First artifact is the *inventory-of-inventory* (devices, addresses, vendors/NOS, sites, credential references, circuits, maps, templates, thresholds, reports, incidents, integrations, config backups, policy rules, scripts). Acceptance for monitoring cutover = parity across topology, inventory, counters, event detection, config backups, alert routing, reports/SLO plus a successful HA/restore exercise.
+
+## 19. Team Shape & Effort (planning guidance only)
+
+Peak program ≈ 18–24 people; MVP start ≈ 10–14. Effort estimate 245–390 person-months (contingency 265–425) across platform/API, discovery/polling, topology/path, storage/query, config/automation, cloud/K8s/security, UI/reports, HA/perf workstreams. ±40 % uncertainty until device counts and migration volumes are measured. AI coding assistants accelerate application CRUD/UI — not multivendor normalization, protocol edge cases or hardware-lab QA.
+
+## 20. Governance
+
+Apache-2.0 core (see §9). DCO 1.1 sign-off on every commit. Public ADR/RFC process (`docs/adr/`). TSC, subsystem maintainers, security response team, release managers and vendor SIGs introduced as ecosystem grows (FR-GOV-002). Semantic versioning for APIs/SDKs; documented migration windows; LTS releases; machine-readable deprecations.
+
+## 21. Collection Strategy Principles
+
+1. Pull is the reconciliation mechanism; push is the freshness mechanism. A trap/syslog saying "link down" triggers a targeted state refresh — it is an event, not durable truth.
+2. Agentless by default where standards expose the data (SNMPv3, gNMI, NETCONF/RESTCONF, SSH, flows, syslog, BMP, BGP-LS); agents only where the control plane cannot see (packet capture, eBPF, synthetic probes, host metrics, K8s flow context).
+3. Capability-driven protocol support: choose the least expensive source meeting required freshness/accuracy.
+4. Sampling hierarchy over global toggles (§3.1.1); cost metrics (`bytes_ingested`, `samples_per_entity`, `flow_rows_per_tenant`, `query_cpu_seconds`, retention cost) are first-class dashboard citizens.
+5. Privacy by design: masking/hashing options, payload suppression, geographic storage restrictions, evidence retained only for its operational/legal purpose (GDPR data-minimization alignment).
+
+## 22. RCA & AIOps Architecture (deterministic first)
+
+RCA combines, in order: deterministic state/threshold logic → dependency-graph propagation → temporal event/change correlation → differential config/path analysis → statistical anomaly & peer groups → active verification → probabilistic ranking → LLM explanation of already-grounded evidence. Every conclusion carries hypothesis + supporting AND contradicting evidence IDs with confidence labels.
+
+AI sits above deterministic tools, never beneath them: `question → authorization → planning → read-only tools → structured evidence → analytics → cited answer → optional proposed workflow → policy/approval → execution`. Statements must trace to evidence ("BGP caused it" is unacceptable; "config change on R17 at 14:03:22; adjacency dropped 4.2 s later; 83 prefixes withdrawn; path changed; latency rose immediately — confidence 0.91, alternative: upstream carrier" is the standard). Prompt-injection isolation, least-privilege tools, secret filtering, tenant-scoped retrieval; unsafe-action target = zero.
 
 ---
 
-*End of PRD v1.0. Implementation questions resolve in favor of: correctness under scale > simplicity > features.*
+*End of PRD v1.1. Implementation questions resolve in favor of: correctness under scale > simplicity > features.*
