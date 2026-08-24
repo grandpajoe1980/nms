@@ -5,7 +5,27 @@ Rules of engagement: docs/PRD.md is source of truth; AGENTS.md workflow applies
 (test + clippy + release + docs same-changeset; tester/prd-reviewer gates;
 commit cites FR/NFR/§ IDs; push every completed increment).
 
-## Session: overnight autonomous run (started 2026-08-24 ~00:30 local)
+## Session: overnight autonomous run (started 2026-08-24 ~00:30 local) — WRAP-UP
+
+**Result: 8 commits pushed, M1 effectively complete, four M2 starters landed.**
+Production instance restarted on v0.2.0 release (monitoring on, health ok).
+
+**What to know when you wake up:**
+1. Every commit on GitHub main is green (tests+clippy+release verified per increment).
+2. `crates/collector-snmp` is a real SNMPv2c GET client (BER codec written from
+   scratch) proven against an in-process mock UDP agent — the foundation for
+   SNMP polling without needing physical devices in CI.
+3. Flap-damping had a latent bug (events could never clear during silence);
+   found by the new fixture suite and fixed with `stable_cycles` tracking.
+4. ServiceNow GA remains blocked pending a SNOW instance for verification.
+5. Honest note: PRD §19 sizes full M2–M8 at 245–425 person-months — "complete"
+   means continued milestone-by-milestone sessions. Next session should start
+   with wiring collector-snmp into discovery (sysName/sysDescr → hostname/
+   vendor/OS), then GETBULK ifTable walks.
+
+**Remaining M2 backlog (in order):** SNMP→discovery integration · ifTable
+interface inventory · LLDP/CDP neighbor topology · SSH config backup + diff ·
+triage-wizard config-diff panel · scheduled reports PDF · scale test AC-NFR-01.
 
 **Directive:** iterate M1-closeout then M2+ slices, auto-commit/push each pass,
 keep this file updated, do not pause for confirmation.
