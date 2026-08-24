@@ -515,10 +515,29 @@ button:hover { background:#26365a; }
 #tooltip .sub { color:var(--dim); }
 #canvas { position:absolute; inset:0; width:100%; height:100%; display:block; cursor:grab; }
 body.noside #side { display:none; }
+#nav { flex:none; background:#0d1526; border-bottom:1px solid var(--edge);
+  display:flex; gap:16px; align-items:center; padding:7px 16px; }
+#nav b { letter-spacing:.5px; font-size:13px; }
+#nav a { color:var(--dim); text-decoration:none; font-size:13px; }
+#nav a:hover { color:var(--text); }
+#nav a.on { color:var(--text); box-shadow:inset 0 -2px 0 var(--up); padding-bottom:3px; }
 </style>
 </head>
 <body>
 <div id="app">
+<div id="nav">
+  <b>NMS</b>
+  <a href="/map" class="on">Map</a>
+  <a href="/console">Console</a>
+  <a href="/devices">Devices</a>
+  <a href="/events">Events</a>
+  <a href="/reports">Reports</a>
+  <a href="/audit">Audit</a>
+  <a href="/settings">Settings</a>
+</div>
+<script>
+if (location.protocol === "file:") document.getElementById("nav").style.display = "none";
+</script>
 <div id="topbar">
   <h1>NMS NETWORK MAP</h1>
   <div class="stats">
