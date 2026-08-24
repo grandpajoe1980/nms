@@ -48,7 +48,8 @@ pub struct DeviceRec {
     pub perf_status: String,
     pub down_since_ts: Option<i64>,
     pub maintenance_until_ts: Option<i64>,
-    pub flap_count: i64,
+        pub flap_count: i64,
+    pub stable_cycles: i64,
     pub hostname: Option<String>,
     pub device_class: Option<String>,
 }
@@ -118,6 +119,7 @@ impl Db {
         for stmt in [
             "ALTER TABLE devices ADD COLUMN hostname TEXT",
             "ALTER TABLE devices ADD COLUMN device_class TEXT",
+            "ALTER TABLE devices ADD COLUMN stable_cycles INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -401,14 +403,15 @@ fn row_device(r: &Row) -> rusqlite::Result<DeviceRec> {
         down_since_ts: r.get(16)?,
         maintenance_until_ts: r.get(17)?,
         flap_count: r.get(18)?,
-        hostname: r.get(19)?,
-        device_class: r.get(20)?,
+        stable_cycles: r.get(19)?,
+        hostname: r.get(20)?,
+        device_class: r.get(21)?,
     })
 }
 
 const DEVICE_COLS: &str = "id, ip, mac, name, role, site_id, site_source, parent_id, managed,
      poll_secs, first_seen_ts, last_seen_ts, ever_up, state, eff_state, perf_status,
-     down_since_ts, maintenance_until_ts, flap_count, hostname, device_class";
+     down_since_ts, maintenance_until_ts, flap_count, stable_cycles, hostname, device_class";
 
 pub fn device_by_ip(conn: &Connection, ip: &str) -> Result<Option<DeviceRec>> {
     let sql = format!("SELECT {DEVICE_COLS} FROM devices WHERE ip = ?1");
@@ -527,11 +530,12 @@ pub fn set_device_fields(
     perf_status: &str,
     down_since_ts: Option<i64>,
     flap_count: i64,
+    stable_cycles: i64,
 ) -> Result<()> {
     conn.execute(
         "UPDATE devices SET eff_state = ?2, perf_status = ?3, down_since_ts = ?4,
-             flap_count = ?5 WHERE id = ?1",
-        params![id, eff_state, perf_status, down_since_ts, flap_count],
+             flap_count = ?5, stable_cycles = ?6 WHERE id = ?1",
+        params![id, eff_state, perf_status, down_since_ts, flap_count, stable_cycles],
     )?;
     Ok(())
 }

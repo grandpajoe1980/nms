@@ -113,6 +113,7 @@ struct Node {
     /// nearest DOWN ancestor/root when unreachable
     root: Option<i64>,
     flap: i64,
+    stable: i64,
     maint_until: Option<i64>,
 }
 
@@ -135,6 +136,7 @@ fn resolve_dependencies(devs: Vec<db::DeviceRec>) -> HashMap<i64, Node> {
                     eff_prev: d.eff_state.clone(),
                     root: None,
                     flap: d.flap_count,
+                    stable: d.stable_cycles,
                     maint_until: d.maintenance_until_ts,
                 },
             )
@@ -301,14 +303,8 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
         }
     }
 
-    let transitioned: HashSet<i64> = res
-        .transitions
-        .iter()
-        .filter_map(|t| ids.get(&t.ip.to_string()).copied())
-        .collect();
 
     let mut fresh_alerts: Vec<EventOut> = Vec::new();
-    let mut n_flap_store: HashMap<i64, i64> = HashMap::new();
 
     for n in nodes.values() {
         if n.eff_prev != n.eff {
@@ -359,9 +355,22 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
             _ => {}
         }
 
-        // ---- flapping (only recompute for devices that moved this sweep)
-        if transitioned.contains(&n.id) {
+        // ---- flapping: flag churn, then require sustained stability to
+        // clear. Stability = consecutive sweeps with unchanged healthy state;
+        // a windowed transition count alone never decays during silence.
+        let mut stable = n.stable;
+        if n.eff_prev != n.eff {
+            stable = 0;
+        } else if n.eff == "up" && !in_maint {
+            stable += 1;
+        } else {
+            stable = 0;
+        }
+        let mut flap_val = n.flap;
+
+        if n.eff_prev != n.eff {
             let count = n_flaps(&tx, n.id, now - flap_window_mins * 60)?;
+            flap_val = count;
             let open_flap = db::open_event_for(&tx, n.id, "flapping")?.is_some();
             if count >= flap_threshold && !open_flap && !in_maint {
                 let ev = db::create_event(&tx, Some(n.id), Some(&n.ip), "flapping",
@@ -369,10 +378,11 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
                     &format!("state changed {count} times in {flap_window_mins} min"),
                     None, now)?;
                 fresh_alerts.push(EventOut { id: ev.id, ip: n.ip.clone(), sev: "warning".into() });
-            } else if count < flap_threshold.saturating_sub(1) && open_flap {
-                db::clear_open_events_of_kind(&tx, n.id, &["flapping"], now)?;
             }
-            n_flap_store.insert(n.id, count);
+        }
+        // clear once stable for `flap_threshold` consecutive healthy sweeps
+        if stable >= flap_threshold {
+            db::clear_open_events_of_kind(&tx, n.id, &["flapping"], now)?;
         }
 
         // ---- perf event lifecycle
@@ -392,8 +402,7 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
         } else {
             None
         };
-        let flap_val = n_flap_store.get(&n.id).copied().unwrap_or(n.flap);
-        db::set_device_fields(&tx, n.id, &n.eff, &perf_status, down_since, flap_val)?;
+        db::set_device_fields(&tx, n.id, &n.eff, &perf_status, down_since, flap_val, stable)?;
         if perf_status != "ok" {
             stats.degraded += 1;
         }

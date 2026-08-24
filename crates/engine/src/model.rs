@@ -83,7 +83,7 @@ pub struct Edge {
     pub kind: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Model {
     pub generated_at: String,
     pub scan_duration_ms: u64,
