@@ -50,6 +50,7 @@ struct Shared {
     events: Mutex<VecDeque<Event>>,
     store: Arc<crate::db::Db>,
     last_stats: Mutex<Option<crate::ops::CycleStats>>,
+    started_ts: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -74,6 +75,7 @@ pub fn run(p: Params) -> Result<()> {
         revision: AtomicU64::new(0),
         events: Mutex::new(VecDeque::new()),
         last_stats: Mutex::new(None),
+        started_ts: chrono::Utc::now().timestamp(),
         store,
     });
     let url = format!("http://{addr}");
@@ -226,6 +228,8 @@ fn route(method: &str, path: &str, query: &str, body: &str, shared: &Arc<Shared>
         ("POST", "/api/webhook/test") => webhook_test(shared),
         ("POST", "/api/diagnose") => diagnose_endpoint(query, shared),
         ("POST", "/api/trace") => trace_endpoint(query, shared),
+        ("GET", "/api/health") => health_endpoint(shared),
+        ("GET", "/api/openapi.json") => json("200 OK", openapi_spec()),
         ("GET", "/api/dashboard.json") => dashboard_json(shared),
         _ if method == "GET" && path.starts_with("/device/") && !path.ends_with(".json") => {
             let ip = url_decode(path.trim_start_matches("/device/"));
@@ -582,6 +586,117 @@ fn trace_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
             .collect()
     };
     json("200 OK", serde_json::json!({"ip": ip.to_string(), "hops": enriched}))
+}
+
+fn health_endpoint(shared: &Arc<Shared>) -> Vec<u8> {
+    // Database probe: time a trivial query. Never hold the lock longer than
+    // this check; a poisoned/hung DB surfaces as degraded, not a hung request.
+    let t0 = std::time::Instant::now();
+    let db_ok = {
+        let conn = shared.store.lock();
+        conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)).is_ok()
+    };
+    let db_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let (job, monitoring) = (
+        *shared.job.lock().unwrap(),
+        shared.monitoring.load(Ordering::Relaxed),
+    );
+    let scheduler_state = match (job, monitoring) {
+        (Job::Idle, false) => "idle",
+        (Job::Idle, true) => "monitoring",
+        (_, _) => "busy",
+    };
+
+    let pending_outbound: i64 = {
+        let conn = shared.store.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM outbound WHERE status = 'pending'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1)
+    };
+
+    let degraded = !db_ok || pending_outbound < 0;
+    json(
+        if degraded { "503 Service Unavailable" } else { "200 OK" },
+        serde_json::json!({
+            "status": if degraded { "degraded" } else { "ok" },
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_secs": chrono::Utc::now().timestamp() - shared.started_ts,
+            "components": {
+                "database": {
+                    "status": if db_ok { "ok" } else { "error" },
+                    "probe_ms": (db_ms * 100.0).round() / 100.0,
+                },
+                "scheduler": {
+                    "status": scheduler_state,
+                    "last_cycle": shared.last_stats.lock().unwrap().clone(),
+                },
+                "webhook_queue": {
+                    "pending": pending_outbound,
+                    "status": if pending_outbound < 0 { "error" } else { "ok" },
+                },
+            },
+        }),
+    )
+}
+
+/// Single source of truth for the public API surface: every entry is served by
+/// `route()` and must appear in `/api/openapi.json` (enforced by unit test).
+pub const API_ROUTES: &[(&str, &str, &str)] = &[
+    ("GET", "/api/status", "Job state, revision, progress and last cycle stats"),
+    ("GET", "/api/health", "Component health: database, scheduler, webhook queue"),
+    ("GET", "/api/openapi.json", "This OpenAPI 3.0 document"),
+    ("GET", "/api/model", "Current discovered topology model.json"),
+    ("GET", "/api/dashboard.json", "Dashboard aggregates: counts, trend, worst latency, event counters"),
+    ("GET", "/api/device/{ip}.json", "One inventory device record"),
+    ("GET", "/api/report/availability.csv", "Per-site availability CSV for a time window"),
+    ("GET", "/api/report/devices.csv", "Per-device availability CSV for a window/site"),
+    ("POST", "/api/discover", "Queue a network discovery crawl"),
+    ("POST", "/api/check", "Queue one status sweep cycle"),
+    ("POST", "/api/monitor/start", "Start continuous monitoring loop"),
+    ("POST", "/api/monitor/stop", "Stop continuous monitoring loop"),
+    ("POST", "/api/ping", "Single ICMP probe of one address"),
+    ("POST", "/api/associate", "Manually bind an endpoint to a WAP"),
+    ("POST", "/api/diagnose", "Burst-ping diagnostics + port profile for one address"),
+    ("POST", "/api/trace", "ICMP traceroute with inventory-enriched hops"),
+    ("POST", "/api/event/ack", "Acknowledge or unacknowledge an event"),
+    ("POST", "/api/device", "Device actions: maintenance, site assignment, managed flag, removal"),
+    ("POST", "/api/settings", "Update known settings keys"),
+    ("POST", "/api/webhook/test", "Send a test payload to the configured webhook"),
+    ("GET", "/api/routes", "IPv4 routing table of the collector host"),
+    ("GET", "/api/ifaces", "Network interfaces of the collector host"),
+];
+
+fn openapi_spec() -> serde_json::Value {
+    use serde_json::json;
+    let mut paths = serde_json::Map::new();
+    for (method, path, summary) in API_ROUTES {
+        // Keys are the exact served paths; `{ip}` stays a template parameter.
+        let entry = paths.entry(*path).or_insert_with(|| json!({}));
+        entry[&method.to_lowercase()] = json!({
+            "summary": summary,
+            "tags": ["nms"],
+            "responses": {
+                "200": { "description": "Success" },
+                "400": { "description": "Bad request" },
+                "404": { "description": "Not found" }
+            }
+        });
+    }
+    json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "nms-ng API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "Unauthenticated embedded API (auth modes arrive in M1 hardened mode). \
+                            Webhook payload contract v1 is frozen per PRD §4.3."
+        },
+        "servers": [{ "url": "/", "description": "same origin" }],
+        "paths": paths,
+    })
 }
 
 fn webhook_test(shared: &Arc<Shared>) -> Vec<u8> {
@@ -947,3 +1062,52 @@ button{background:#2563eb;color:#fff;border:0;border-radius:7px;padding:10px 16p
 <button id="discover">Discover network</button><div id="status">Ready</div></div>
 <script>const b=document.getElementById('discover'),s=document.getElementById('status');b.onclick=async()=>{b.disabled=true;s.textContent='Discovery queued...';const r=await fetch('/api/discover',{method:'POST'});if(!r.ok){s.textContent=await r.text();b.disabled=false;return}const t=setInterval(async()=>{const j=await(await fetch('/api/status')).json();s.textContent=j.message;if(j.job==='idle'){clearInterval(t);location.reload()}},1500)};</script>
 </body></html>"##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            job: Mutex::new(Job::Idle),
+            message: Mutex::new("ready".into()),
+            monitoring: Arc::new(AtomicBool::new(false)),
+            engine_lock: Mutex::new(()),
+            revision: AtomicU64::new(0),
+            events: Mutex::new(VecDeque::new()),
+            store: Arc::new(crate::db::Db::open_memory().unwrap()),
+            last_stats: Mutex::new(None),
+            started_ts: chrono::Utc::now().timestamp(),
+        })
+    }
+
+    #[test]
+    fn openapi_covers_every_registered_route() {
+        let spec = openapi_spec();
+        assert_eq!(spec["openapi"], "3.0.3");
+        let paths = spec["paths"].as_object().expect("paths object");
+        for (method, path, summary) in API_ROUTES {
+            let node = paths
+                .get(*path)
+                .unwrap_or_else(|| panic!("openapi missing path {path}"));
+            assert!(
+                node.get(method.to_lowercase()).is_some(),
+                "openapi missing {method} {path}"
+            );
+            assert!(!summary.is_empty());
+        }
+    }
+
+    #[test]
+    fn health_is_ok_on_healthy_store() {
+        let resp = health_endpoint(&test_shared());
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
+        let body = &text[text.find('{').unwrap()..];
+        let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["components"]["database"]["status"], "ok");
+        assert_eq!(v["components"]["scheduler"]["status"], "idle");
+        assert_eq!(v["components"]["webhook_queue"]["pending"], 0);
+    }
+}

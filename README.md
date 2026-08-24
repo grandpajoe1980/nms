@@ -80,6 +80,8 @@ links to the full console:
 
 ```
 GET  /api/status                 job state + last cycle stats
+GET  /api/health                 component health: database probe, scheduler state, webhook queue depth (503 when degraded)
+GET  /api/openapi.json           OpenAPI 3.0 spec of the full API surface
 GET  /api/dashboard.json         counts, trend, worst latency, event counters
 GET  /api/devices.json           inventory rows
 GET  /api/device/<ip>.json       one device record
