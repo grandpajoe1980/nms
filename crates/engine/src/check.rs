@@ -47,10 +47,7 @@ pub fn sweep_once(p: &Params) -> Result<RunResult> {
     let t0 = Instant::now();
     let deadline = t0 + std::time::Duration::from_secs(p.budget_secs);
 
-    let mut model = match Model::load(&p.out_dir.join("model.json")) {
-        Ok(m) => m,
-        Err(_) => Model::new(),
-    };
+    let mut model = Model::load(&p.out_dir.join("model.json")).unwrap_or_default();
 
     let mut known: BTreeSet<String> = model.subnets.iter().map(|s| s.cidr.clone()).collect();
     for n in &p.extra_subnets {

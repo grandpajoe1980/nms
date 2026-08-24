@@ -93,6 +93,12 @@ pub struct Model {
     pub edges: Vec<Edge>,
 }
 
+impl Default for Model {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Model {
     pub fn new() -> Self {
         Model {

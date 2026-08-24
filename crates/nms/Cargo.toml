@@ -1,0 +1,18 @@
+[package]
+name = "nms"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nms"
+path = "src/main.rs"
+
+[dependencies]
+nms-engine = { path = "../engine" }
+nms-core-api = { path = "../core-api" }
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+chrono.workspace = true
+ipnet.workspace = true
+if-addrs.workspace = true
+

@@ -187,6 +187,10 @@ cargo test
 target/release/nms.exe serve
 ```
 
+The repo is a Cargo workspace (PRD §11): `crates/engine` (sweeps, inventory,
+ops pipeline, diagnostics — Rust domain core), `crates/core-api` (HTTP server +
+web console), and `crates/nms` (the `nms` CLI binary, thin over both).
+
 ## Tuning checklist
 
 | symptom | fix |

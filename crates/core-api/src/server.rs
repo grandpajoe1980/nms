@@ -1,11 +1,11 @@
-use crate::check::{self, Transition};
-use crate::db;
-use crate::discover;
-use crate::engine::ScanParams;
-use crate::model::{Model, State};
-use crate::report;
-use anyhow::Result;
+use engine::check::{self, Transition};
+use engine::db;
+use engine::discover;
+use engine::ScanParams;
 use ipnet::Ipv4Net;
+use engine::model::{Model, State};
+use engine::report;
+use anyhow::Result;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -49,8 +49,8 @@ struct Shared {
     engine_lock: Mutex<()>,
     revision: AtomicU64,
     events: Mutex<VecDeque<Event>>,
-    store: Arc<crate::db::Db>,
-    last_stats: Mutex<Option<crate::ops::CycleStats>>,
+    store: Arc<engine::db::Db>,
+    last_stats: Mutex<Option<engine::ops::CycleStats>>,
     started_ts: i64,
     hardened: bool,
 }
@@ -62,7 +62,7 @@ fn resolve_role(shared: &Shared, authorization: Option<&str>, cookie: Option<&st
     if let Some(header) = authorization {
         let raw = header.strip_prefix("Bearer ").map(str::trim).filter(|s| !s.is_empty());
         if let Some(raw) = raw {
-            let hashed = crate::auth::token_hash(raw);
+            let hashed = engine::auth::token_hash(raw);
             if let Ok(Some(role)) = db::api_token_role(&conn, &hashed) {
                 return Some(role);
             }
@@ -71,7 +71,7 @@ fn resolve_role(shared: &Shared, authorization: Option<&str>, cookie: Option<&st
     let raw = cookie
         .and_then(|c| c.split(';').find_map(|part| part.trim().strip_prefix("nms_session=")))
         .filter(|s| !s.is_empty())?;
-    db::session_role(&conn, &crate::auth::token_hash(raw)).ok().flatten()
+    db::session_role(&conn, &engine::auth::token_hash(raw)).ok().flatten()
 }
 
 fn login_page(err: Option<&str>) -> Vec<u8> {
@@ -138,13 +138,13 @@ pub fn run(p: Params) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid --bind '{}': {e}", p.bind))?;
     let hardened = !bind_ip.is_loopback()
         || db::get_setting_or(
-            &crate::db::Db::open(&p.out_dir.join("ops.db"))?.lock(),
+            &engine::db::Db::open(&p.out_dir.join("ops.db"))?.lock(),
             "auth_mode",
             "open",
         ) == "hardened";
     let addr = format!("{}:{}", p.bind, p.port);
     let listener = TcpListener::bind(&addr)?;
-    let store = Arc::new(crate::db::Db::open(&p.out_dir.join("ops.db"))?);
+    let store = Arc::new(engine::db::Db::open(&p.out_dir.join("ops.db"))?);
     let shared = Arc::new(Shared {
         job: Mutex::new(Job::Idle),
         message: Mutex::new("ready".into()),
@@ -159,11 +159,11 @@ pub fn run(p: Params) -> Result<()> {
     });
     let url = format!("http://{addr}");
     println!("[*] NMS control panel: {url}");
-    let pending = crate::ops::spool_count(&p.out_dir);
+    let pending = engine::ops::spool_count(&p.out_dir);
     if pending > 0 {
         println!("[*] {pending} spooled cycle(s) pending replay");
     }
-    match crate::ops::replay_spool(&shared.store, &p.out_dir) {
+    match engine::ops::replay_spool(&shared.store, &p.out_dir) {
         Ok(n) if n > 0 => println!("[*] replayed {n} spooled cycle(s)"),
         Ok(_) => {}
         Err(e) => eprintln!("[!] spool replay failed: {e}"),
@@ -174,9 +174,9 @@ pub fn run(p: Params) -> Result<()> {
         println!("[*] auth mode: open (no login required)");
     }
     println!("[*] Ctrl+C stops the web server and any in-process monitor loop");
-    crate::jobs::start_housekeeping(Arc::clone(&shared.store));
-    crate::jobs::start_webhook_sender(Arc::clone(&shared.store));
-    crate::jobs::start_report_writer(Arc::clone(&shared.store), p.out_dir.clone());
+    engine::jobs::start_housekeeping(Arc::clone(&shared.store));
+    engine::jobs::start_webhook_sender(Arc::clone(&shared.store));
+    engine::jobs::start_report_writer(Arc::clone(&shared.store), p.out_dir.clone());
     if !p.no_open {
         let _ = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
     }
@@ -238,7 +238,7 @@ fn handle(stream: TcpStream, shared: Arc<Shared>, p: Params) {
 
     // Hardened-mode enforcement gate (FR-PLAT-005).
     if shared.hardened {
-        if let Some((rank, is_api)) = crate::auth::requirement(method, path) {
+        if let Some((rank, is_api)) = engine::auth::requirement(method, path) {
             match resolve_role(&shared, authorization.as_deref(), cookie.as_deref()) {
                 None => {
                     let _ = writer.write_all(&unauthorized(is_api));
@@ -246,9 +246,9 @@ fn handle(stream: TcpStream, shared: Arc<Shared>, p: Params) {
                     return;
                 }
                 Some(role_str) => {
-                    let role = crate::auth::Role::parse(&role_str)
-                        .unwrap_or(crate::auth::Role::Viewer);
-                    if !crate::auth::authorized(role, is_api, rank) {
+                    let role = engine::auth::Role::parse(&role_str)
+                        .unwrap_or(engine::auth::Role::Viewer);
+                    if !engine::auth::authorized(role, is_api, rank) {
                         let _ = writer.write_all(&forbidden(is_api));
                         let _ = writer.flush();
                         return;
@@ -331,7 +331,7 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
             let hours: i64 = query_param(query, "hours").and_then(|h| h.parse().ok()).unwrap_or(24);
             text_csv(
                 "200 OK",
-                crate::ui::availability_csv(&shared.store.lock(), hours.clamp(1, 24 * 45)),
+                engine::reports::availability_csv(&shared.store.lock(), hours.clamp(1, 24 * 45)),
             )
         }
         ("GET", "/api/report/devices.csv") => {
@@ -339,7 +339,7 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
             let site = query_param(query, "site").filter(|s| !s.is_empty());
             text_csv(
                 "200 OK",
-                crate::ui::devices_csv(&shared.store.lock(), hours.clamp(1, 24 * 45), site.as_deref()),
+                engine::reports::devices_csv(&shared.store.lock(), hours.clamp(1, 24 * 45), site.as_deref()),
             )
         }
         ("POST", "/api/settings") => settings_save(body, shared),
@@ -359,8 +359,8 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
                 .flatten()
                 .filter(|u| !u.disabled);
             match user {
-                Some(u) if crate::auth::verify_password(&password, &u.password_hash) => {
-                    let (raw, hashed) = crate::auth::new_token();
+                Some(u) if engine::auth::verify_password(&password, &u.password_hash) => {
+                    let (raw, hashed) = engine::auth::new_token();
                     let expires = chrono::Utc::now().timestamp() + 7 * 86_400;
                     let _ = db::create_session(&shared.store.lock(), &hashed, u.id, &u.role, expires);
                     db::audit(&shared.store.lock(), &format!("web:{}", u.username), "auth.login", &u.username, "");
@@ -374,7 +374,7 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
         }
         ("POST", "/logout") => {
             if let Some(raw) = cookie.and_then(|c| c.split(';').find_map(|p| p.trim().strip_prefix("nms_session="))) {
-                let hashed = crate::auth::token_hash(raw);
+                let hashed = engine::auth::token_hash(raw);
                 let _ = db::delete_session(&shared.store.lock(), &hashed);
             }
             see_other("/login")
@@ -408,7 +408,7 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
                     "monitoring": shared.monitoring.load(Ordering::Relaxed),
                     "message": shared.message.lock().unwrap().clone(),
                     "revision": shared.revision.load(Ordering::Relaxed),
-                    "progress": crate::progress::snapshot(),
+                    "progress": engine::progress::snapshot(),
                     "events": shared.events.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
                     "ops": stats,
                 }),
@@ -638,7 +638,7 @@ fn diagnose_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
     let count: u32 = query_param(query, "count").and_then(|v| v.parse().ok()).unwrap_or(40);
     let count = count.clamp(5, 200);
     let started = std::time::Instant::now();
-    let diag = match crate::diag::run_burst(ip, count, 25.0, 1000) {
+    let diag = match engine::diag::run_burst(ip, count, 25.0, 1000) {
         Ok(d) => d,
         Err(e) => return json("500 Internal Server Error", serde_json::json!({"error": e.to_string()})),
     };
@@ -649,7 +649,7 @@ fn diagnose_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
             _ => ("endpoint".into(), None),
         }
     };
-    let prof = crate::profile::profile_endpoint(ip, mac_hint.as_deref(), &role_hint);
+    let prof = engine::profile::profile_endpoint(ip, mac_hint.as_deref(), &role_hint);
     {
         let conn = shared.store.lock();
         if let Ok(Some(dev)) = db::device_by_ip(&conn, &ip.to_string()) {
@@ -683,12 +683,12 @@ fn diagnose_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
         .map(|p| {
             serde_json::json!({
                 "port": p,
-                "service": crate::profile::service_names().get(p).copied().unwrap_or("?"),
+                "service": engine::profile::service_names().get(p).copied().unwrap_or("?"),
             })
         })
         .collect();
     let missing: Vec<u16> =
-        crate::profile::missing_expected(&prof.device_class, &prof.open_ports);
+        engine::profile::missing_expected(&prof.device_class, &prof.open_ports);
     json(
         "200 OK",
         serde_json::json!({
@@ -707,7 +707,7 @@ fn trace_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
         return json("400 Bad Request", serde_json::json!({"error":"query parameter ip is required"}));
     };
     let max_hops: u8 = query_param(query, "max").and_then(|v| v.parse().ok()).unwrap_or(15);
-    let hops = match crate::trace::trace_path(ip, max_hops.clamp(3, 30), 700, 3) {
+    let hops = match engine::trace::trace_path(ip, max_hops.clamp(3, 30), 700, 3) {
         Ok(h) => h,
         Err(e) => return json("500 Internal Server Error", serde_json::json!({"error": e.to_string()})),
     };
@@ -868,7 +868,7 @@ fn webhook_test(shared: &Arc<Shared>) -> Vec<u8> {
         "message": "NMS webhook connectivity test",
     });
     // NOTE: no DB lock held during network I/O.
-    let result = crate::jobs::send_webhook(&url, payload);
+    let result = engine::jobs::send_webhook(&url, payload);
     {
         let conn = shared.store.lock();
         match result {
@@ -932,7 +932,7 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
             retire_days: 30,
         })
         .map(|m| {
-            if let Ok(ids) = crate::ops::sync_model(
+            if let Ok(ids) = engine::ops::sync_model(
                 &shared.store.lock(),
                 &m,
                 db::get_setting_or(&shared.store.lock(), "site_auto_prefix", "24")
@@ -949,7 +949,7 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
                 format!("discovery complete: {} devices, {} subnets", m.devices.len(), m.subnets.len())
             }
         }),
-        Job::Check => match crate::ops::run_cycle(&check_params(&p), &shared.store) {
+        Job::Check => match engine::ops::run_cycle(&check_params(&p), &shared.store) {
             Ok((result, stats)) => {
                 for transition in &result.transitions {
                     push_transition(&shared, transition);
@@ -1019,7 +1019,7 @@ fn monitor_loop(shared: Arc<Shared>, p: Params) {
             if !shared.monitoring.load(Ordering::Relaxed) {
                 break;
             }
-            match crate::ops::run_cycle(&check_params(&p), &shared.store) {
+            match engine::ops::run_cycle(&check_params(&p), &shared.store) {
                 Ok((result, stats)) => {
                     for transition in &result.transitions {
                         push_transition(&shared, transition);
@@ -1064,7 +1064,7 @@ fn ping_endpoint(query: &str) -> Vec<u8> {
     let Some(ip) = ip else {
         return json("400 Bad Request", serde_json::json!({"error":"query parameter ip is required"}));
     };
-    let mut pinger = match crate::ping::open(1000, 32) {
+    let mut pinger = match engine::ping::open(1000, 32) {
         Ok(p) => p,
         Err(e) => return json("500 Internal Server Error", serde_json::json!({"error":e.to_string()})),
     };
@@ -1105,13 +1105,13 @@ fn associate_endpoint(query: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> 
     let Some(device_idx) = model.devices.iter().position(|d| d.ip == device) else {
         return json("404 Not Found", serde_json::json!({"error":"device not found"}));
     };
-    if model.devices[device_idx].role != crate::model::Role::Endpoint {
+    if model.devices[device_idx].role != engine::model::Role::Endpoint {
         return json("400 Bad Request", serde_json::json!({"error":"only endpoints can be assigned to a WAP"}));
     }
     if let Some(wap_ip) = wap {
         let valid = model.devices.iter().any(|candidate| {
             candidate.ip == wap_ip
-                && candidate.role == crate::model::Role::Wap
+                && candidate.role == engine::model::Role::Wap
                 && candidate.subnet == model.devices[device_idx].subnet
         });
         if !valid {
@@ -1178,7 +1178,7 @@ fn push_event(shared: &Arc<Shared>, event: Event) {
 
 fn routes_endpoint() -> Vec<u8> {
     let mut body = String::from("prefix               next-hop         metric\n");
-    for route in crate::routes::read() {
+    for route in engine::routes::read() {
         body += &format!(
             "{:<20} {:<16} {}\n",
             route.prefix,
@@ -1194,7 +1194,7 @@ fn ifaces_endpoint() -> Vec<u8> {
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for iface in ifaces {
             if let if_addrs::IfAddr::V4(v4) = iface.addr {
-                let prefix = crate::netutil::mask_to_prefix(v4.netmask);
+                let prefix = engine::netutil::mask_to_prefix(v4.netmask);
                 body += &format!("{:<24} {}/{}\n", iface.name, v4.ip, prefix);
             }
         }
@@ -1225,7 +1225,7 @@ mod tests {
             engine_lock: Mutex::new(()),
             revision: AtomicU64::new(0),
             events: Mutex::new(VecDeque::new()),
-            store: Arc::new(crate::db::Db::open_memory().unwrap()),
+            store: Arc::new(engine::db::Db::open_memory().unwrap()),
             last_stats: Mutex::new(None),
             started_ts: chrono::Utc::now().timestamp(),
             hardened: false,

@@ -113,7 +113,7 @@ pub fn start_report_writer(dbh: Arc<Db>, out_dir: PathBuf) {
                     continue;
                 }
                 let conn = dbh.lock();
-                let csv = crate::ui::availability_csv(&conn, 24);
+                let csv = crate::reports::availability_csv(&conn, 24);
                 drop(conn);
                 let _ = std::fs::write(reports_dir.join("latest-24h.csv"), &csv);
                 let day = chrono::Utc::now().format("%Y-%m-%d").to_string();

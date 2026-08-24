@@ -1,29 +1,8 @@
-mod arp;
-mod auth;
-mod check;
-mod db;
-mod diag;
-mod discover;
-mod engine;
-mod jobs;
-mod model;
-mod monitor;
-mod netutil;
-mod ops;
-mod oui;
-mod ping;
-mod profile;
-mod progress;
-mod report;
-mod routes;
-mod server;
-mod trace;
-mod ui;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use ipnet::Ipv4Net;
-use model::{Model, Role, State};
+use engine::model::{Model, Role, State};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -199,7 +178,7 @@ enum Cmd {
 fn parse_subnets(v: Option<Vec<String>>) -> Result<Vec<Ipv4Net>> {
     match v {
         None => Ok(Vec::new()),
-        Some(parts) => netutil::parse_cidrs(&parts.join(",")),
+        Some(parts) => engine::netutil::parse_cidrs(&parts.join(",")),
     }
 }
 
@@ -259,7 +238,7 @@ fn main() -> Result<()> {
             if !full && budget_mins >= 60 {
                 bail!("--budget-mins must stay under 60 (discovery requirement); use --full to override at your own risk");
             }
-            let m = discover::run(discover::Params {
+            let m = engine::discover::run(engine::discover::Params {
                 extra_subnets: parse_subnets(subnets)?,
                 full,
                 big_threshold,
@@ -277,13 +256,13 @@ fn main() -> Result<()> {
                 deep,
                 retire_days,
             })?;
-            let store = db::Db::open(&out.join("ops.db"))?;
+            let store = engine::db::Db::open(&out.join("ops.db"))?;
             {
                 let c = store.lock();
-                let prefix: u8 = db::get_setting_or(&c, "site_auto_prefix", "24")
+                let prefix: u8 = engine::db::get_setting_or(&c, "site_auto_prefix", "24")
                     .parse()
                     .unwrap_or(24);
-                match ops::sync_model(&c, &m, prefix) {
+                match engine::ops::sync_model(&c, &m, prefix) {
                     Ok(ids) => println!("[*] inventory synced: {} device(s)", ids.len()),
                     Err(e) => eprintln!("[!] inventory sync failed: {e}"),
                 }
@@ -300,7 +279,7 @@ fn main() -> Result<()> {
             confirm_down,
             out,
         } => {
-            let params = check::Params {
+            let params = engine::check::Params {
                 extra_subnets: parse_subnets(subnets)?,
                 scan: engine::ScanParams {
                     rate_pps: rate,
@@ -313,8 +292,8 @@ fn main() -> Result<()> {
                 budget_secs,
                 confirm_down,
             };
-            let store = Arc::new(db::Db::open(&out.join("ops.db"))?);
-            let (res, stats) = ops::run_cycle(&params, &store)?;
+            let store = Arc::new(engine::db::Db::open(&out.join("ops.db"))?);
+            let (res, stats) = engine::ops::run_cycle(&params, &store)?;
             println!(
                 "[ops] up={up} down_root={down} unreachable={unreach} degraded={deg} \
                      events=+{ev} queued={q} in {ms} ms",
@@ -329,12 +308,12 @@ fn main() -> Result<()> {
             print_summary(&res.model);
         }
         Cmd::Monitor { interval_secs, exec, subnets, rate, concurrency, timeout_ms, max_targets, budget_secs, confirm_down, out } => {
-            let store = Arc::new(db::Db::open(&out.join("ops.db"))?);
-            jobs::start_housekeeping(Arc::clone(&store));
-            jobs::start_webhook_sender(Arc::clone(&store));
-            jobs::start_report_writer(Arc::clone(&store), out.clone());
-            monitor::run(monitor::Params {
-                check: check::Params {
+            let store = Arc::new(engine::db::Db::open(&out.join("ops.db"))?);
+            engine::jobs::start_housekeeping(Arc::clone(&store));
+            engine::jobs::start_webhook_sender(Arc::clone(&store));
+            engine::jobs::start_report_writer(Arc::clone(&store), out.clone());
+            engine::monitor::run(engine::monitor::Params {
+                check: engine::check::Params {
                     extra_subnets: parse_subnets(subnets)?,
                     scan: engine::ScanParams {
                         rate_pps: rate,
@@ -355,13 +334,13 @@ fn main() -> Result<()> {
             let path = out.join("model.json");
             let m = Model::load(&path).map_err(|e| anyhow::anyhow!("cannot load {}: {e}", path.display()))?;
             std::fs::create_dir_all(&out)?;
-            let html = report::render(&m, 3500)?;
+            let html = engine::report::render(&m, 3500)?;
             let dest = out.join("map.html");
             std::fs::write(&dest, html)?;
             println!("[*] wrote {}", dest.display());
         }
         Cmd::Serve { port, bind, no_open, interval_secs, subnets, out } => {
-            server::run(server::Params {
+            core_api::server::run(core_api::server::Params {
                 port,
                 bind,
                 no_open,
@@ -372,7 +351,7 @@ fn main() -> Result<()> {
         }
         Cmd::User { action } => match action {
             UserAction::Add { username, role, password, out } => {
-                auth::Role::parse(&role)?;
+                engine::auth::Role::parse(&role)?;
                 let pass = match password {
                     Some(p) => p,
                     None => {
@@ -387,26 +366,26 @@ fn main() -> Result<()> {
                 if pass.len() < 8 {
                     bail!("password must be at least 8 characters");
                 }
-                let store = db::Db::open(&out.join("ops.db"))?;
+                let store = engine::db::Db::open(&out.join("ops.db"))?;
                 let c = store.lock();
-                if db::get_user(&c, &username)?.is_some() {
+                if engine::db::get_user(&c, &username)?.is_some() {
                     bail!("user '{username}' already exists");
                 }
-                let hash = auth::hash_password(&pass)?;
-                let id = db::create_user(&c, &username, &hash, &role)?;
+                let hash = engine::auth::hash_password(&pass)?;
+                let id = engine::db::create_user(&c, &username, &hash, &role)?;
                 drop(c);
                 println!("[+] created user '{username}' (role={role}, id={id})");
             }
             UserAction::List { out } => {
-                let store = db::Db::open(&out.join("ops.db"))?;
+                let store = engine::db::Db::open(&out.join("ops.db"))?;
                 let c = store.lock();
-                for (name, role, disabled) in db::list_users(&c)? {
+                for (name, role, disabled) in engine::db::list_users(&c)? {
                     println!("{name:<24} {role:<12} {}", if disabled { "disabled" } else { "active" });
                 }
             }
             UserAction::Disable { username, out } => {
-                let store = db::Db::open(&out.join("ops.db"))?;
-                let n = db::set_user_disabled(&store.lock(), &username, true)?;
+                let store = engine::db::Db::open(&out.join("ops.db"))?;
+                let n = engine::db::set_user_disabled(&store.lock(), &username, true)?;
                 if n == 0 {
                     bail!("no such user '{username}'");
                 }
@@ -415,15 +394,15 @@ fn main() -> Result<()> {
         },
         Cmd::Token { action } => match action {
             TokenAction::Add { name, role, out } => {
-                auth::Role::parse(&role)?;
-                let (raw, hashed) = auth::new_token();
-                let store = db::Db::open(&out.join("ops.db"))?;
-                db::add_api_token(&store.lock(), &hashed, &name, &role)?;
+                engine::auth::Role::parse(&role)?;
+                let (raw, hashed) = engine::auth::new_token();
+                let store = engine::db::Db::open(&out.join("ops.db"))?;
+                engine::db::add_api_token(&store.lock(), &hashed, &name, &role)?;
                 println!("[+] token '{name}' created (role={role})");
                 println!("    raw token (shown once, stored hashed): {raw}");
             }
             TokenAction::List { out } => {
-                let store = db::Db::open(&out.join("ops.db"))?;
+                let store = engine::db::Db::open(&out.join("ops.db"))?;
                 let c = store.lock();
                 let mut stmt = c.prepare("SELECT name, role, disabled, created_ts FROM api_tokens ORDER BY name")?;
                 for row in stmt.query_map([], |r| {
@@ -441,7 +420,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Routes => {
-            let rt = routes::read();
+            let rt = engine::routes::read();
             println!("{:<20} {:<16} metric", "prefix", "next-hop");
             for r in &rt {
                 println!("{:<20} {:<16} {}", r.prefix.to_string(), r.next_hop.map_or("-".into(), |g| g.to_string()), r.metric);
@@ -454,7 +433,7 @@ fn main() -> Result<()> {
             let ifs = if_addrs::get_if_addrs()?;
             for i in ifs {
                 if let if_addrs::IfAddr::V4(v4) = i.addr {
-                    let prefix = netutil::mask_to_prefix(v4.netmask);
+                    let prefix = engine::netutil::mask_to_prefix(v4.netmask);
                     let net = Ipv4Net::new(v4.ip, prefix).map(|n| n.trunc());
                     println!(
                         "{:<14} {:<16}/{:<2} -> {}",
@@ -480,7 +459,7 @@ fn main() -> Result<()> {
                 let out = engine::sweep(&targets, &params, None, None)?;
                 println!("elapsed {:>7.1}ms | {:?}", t0.elapsed().as_secs_f64() * 1000.0, out[0]);
             } else {
-                let mut p = ping::open(timeout_ms, 32)?;
+                let mut p = engine::ping::open(timeout_ms, 32)?;
                 let t0 = std::time::Instant::now();
                 let r = p.ping(ip, ttl);
                 println!("elapsed {:>6.1}ms | {:?}", t0.elapsed().as_secs_f64() * 1000.0, r);

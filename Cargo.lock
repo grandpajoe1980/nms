@@ -579,9 +579,35 @@ name = "nms"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "argon2",
  "chrono",
  "clap",
+ "if-addrs",
+ "ipnet",
+ "nms-core-api",
+ "nms-engine",
+]
+
+[[package]]
+name = "nms-core-api"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "if-addrs",
+ "ipnet",
+ "nms-engine",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nms-engine"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "chrono",
  "dns-lookup",
  "if-addrs",
  "ipnet",
