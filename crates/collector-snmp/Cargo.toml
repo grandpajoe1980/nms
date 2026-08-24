@@ -1,0 +1,11 @@
+[package]
+name = "collector-snmp"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "snmp"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true

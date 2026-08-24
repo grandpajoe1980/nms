@@ -51,9 +51,22 @@ fixture-based tests, ServiceNow GA. M2–M8 untouched.
 | A | Alarm fixture suite | FR-FLT-004/005, AC-FLT-004 | ✅ done |
 | B | Prometheus exposition `/metrics` | FR-INTG-003 | next |
 | C | Triage wizard `/triage?ip=` | FR-UX-005 v0 | pending |
-| D | SLA targets per site + attainment | FR-REP-002 v0 | pending |
-| E | Global device search API + palette | FR-UX-004 v0 | pending |
-| F | SNMP v2c poller w/ mock BER agent | FR-PRF-003 v0 | pending |
+| D | SLA targets per site + attainment | FR-REP-002 v0 | ✅ done |
+| E | Global device search API + palette | FR-UX-004 v0 | ✅ done |
+| F | SNMP v2c poller w/ mock BER agent | FR-PRF-003 v0 | ✅ done |
+
+### ✅ Session log
+
+**B** `/metrics` Prometheus gauges (commit 4c9d1c0) — labeled-series spacing bug caught by test, fixed.
+**C** Triage wizard `/triage?ip=` (1c9dfa7) — causal chain walk, impact list, inline diagnostics (FR-UX-005 v0).
+**D** SLA targets + met/missed in reports HTML/CSV (84d21e8) — `sla_target_pct` setting (FR-REP-002 v0).
+**E** Global search API + nav search box (1b9ecf6) — verified live: 18 devices matched (FR-UX-004 v0).
+**F** `crates/collector-snmp` (this commit) — hand-rolled BER codec, GET builder, response parser
+(accepts any context PDU tag so client+agent share one decoder), UDP client w/ timeout + request-id
+match; **mock SNMP agent fixture** answering from a varbind table; 4 tests incl. end-to-end UDP
+roundtrip and unknown-OID→Null. Test totals now **31 passing**, clippy clean, release builds.
+**Next up:** wire SNMP poller into discovery (sysName/sysDescr/sysUpTime → hostname/vendor/OS),
+then GETBULK ifTable walk for interface inventory (FR-DISC-003).
 
 **Blocked / deferred (not stoppable by me):**
 - ServiceNow GA (FR-INTG-001a) — needs a live SNOW instance for AC-INTG-SNOW.

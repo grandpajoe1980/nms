@@ -4,6 +4,7 @@ members = [
     "crates/engine",
     "crates/core-api",
     "crates/nms",
+    "crates/collector-snmp",
 ]
 
 [workspace.package]
