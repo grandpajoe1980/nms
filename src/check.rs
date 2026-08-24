@@ -29,7 +29,7 @@ pub struct Transition {
     pub to: State,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Probe {
     pub ip: Ipv4Addr,
     pub up: bool,

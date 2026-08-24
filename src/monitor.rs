@@ -19,6 +19,15 @@ pub fn run(p: Params) -> Result<()> {
     );
     println!("[*] alerts fire on up->down transitions; Ctrl+C to stop");
     let store = std::sync::Arc::new(crate::db::Db::open(&p.check.out_dir.join("ops.db"))?);
+    let pending = crate::ops::spool_count(&p.check.out_dir);
+    if pending > 0 {
+        println!("[*] {pending} spooled cycle(s) pending replay");
+    }
+    match crate::ops::replay_spool(&store, &p.check.out_dir) {
+        Ok(n) if n > 0 => println!("[*] replayed {n} spooled cycle(s)"),
+        Ok(_) => {}
+        Err(e) => eprintln!("[!] spool replay failed: {e}"),
+    }
     let mut cycle = 0u64;
     loop {
         cycle += 1;

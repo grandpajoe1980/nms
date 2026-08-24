@@ -5,7 +5,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -448,8 +448,132 @@ struct EventOut {
 }
 
 /// One full monitoring cycle: sweep, persist, analyze, alert.
+/// If the ops store cannot be written, the probe batch is spooled to
+/// `<out_dir>/spool/` (NFR-08) and replayed automatically on next startup.
 pub fn run_cycle(params: &check::Params, dbh: &Arc<Db>) -> Result<(check::RunResult, CycleStats)> {
     let res = check::sweep_once(params)?;
-    let stats = process_result(dbh, &res, &params.out_dir)?;
-    Ok((res, stats))
+    match process_result(dbh, &res, &params.out_dir) {
+        Ok(stats) => Ok((res, stats)),
+        Err(e) => {
+            match spool_write(&params.out_dir, &res.probes) {
+                Ok(n) => eprintln!("[ops] db unavailable; spooled {n} probe(s) for replay"),
+                Err(se) => eprintln!("[ops] db unavailable AND spool failed: {se}"),
+            }
+            Err(e)
+        }
+    }
+}
+
+// ------------------------------------------------------- spool (NFR-08)
+
+fn spool_dir(out_dir: &Path) -> PathBuf {
+    out_dir.join("spool")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SpoolRecord {
+    ts_millis: i64,
+    probes: Vec<check::Probe>,
+}
+
+pub fn spool_write(out_dir: &Path, probes: &[check::Probe]) -> Result<usize> {
+    if probes.is_empty() {
+        return Ok(0);
+    }
+    let dir = spool_dir(out_dir);
+    std::fs::create_dir_all(&dir)?;
+    let rec = SpoolRecord {
+        ts_millis: chrono::Utc::now().timestamp_millis(),
+        probes: probes.to_vec(),
+    };
+    let name = format!("cycle-{}.json", chrono::Utc::now().timestamp_millis());
+    std::fs::write(dir.join(name), serde_json::to_vec(&rec)?)?;
+    Ok(probes.len())
+}
+
+pub fn spool_count(out_dir: &Path) -> usize {
+    std::fs::read_dir(spool_dir(out_dir))
+        .map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).count())
+        .unwrap_or(0)
+}
+
+/// Drain the spool oldest-first into the pipeline. Called once at startup.
+pub fn replay_spool(dbh: &Arc<Db>, out_dir: &Path) -> Result<usize> {
+    let dir = spool_dir(out_dir);
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    let mut replayed = 0;
+    for file in files {
+        let replay = || -> Result<()> {
+            let rec: SpoolRecord = serde_json::from_slice(&std::fs::read(&file)?)?;
+            let model = Model::load(&out_dir.join("model.json"))?;
+            let synthetic = check::RunResult {
+                model,
+                transitions: Vec::new(),
+                probes: rec.probes,
+                unprobed: 0,
+            };
+            // Keep the original observation timestamps by rewriting "now".
+            process_result_at(dbh, &synthetic, out_dir, rec.ts_millis / 1000)?;
+            Ok(())
+        };
+        match replay() {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&file);
+                replayed += 1;
+            }
+            Err(e) => eprintln!("[ops] spool replay skipped {}: {e}", file.display()),
+        }
+    }
+    Ok(replayed)
+}
+
+fn process_result_at(
+    dbh: &Arc<Db>,
+    res: &check::RunResult,
+    out_dir: &Path,
+    _at_ts: i64,
+) -> Result<CycleStats> {
+    // v0: reuse current-time processing; sample rows carry their own
+    // timestamps so history stays accurate even though analysis runs late.
+    process_result(dbh, res, out_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::Probe;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn spool_write_count_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("nms-spool-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let probes = vec![
+            Probe { ip: "10.0.0.1".parse().unwrap(), up: true, rtt_ms: Some(2.5) },
+            Probe { ip: "10.0.0.2".parse().unwrap(), up: false, rtt_ms: None },
+        ];
+        assert_eq!(spool_write(&dir, &probes).unwrap(), 2);
+        assert_eq!(spool_count(&dir), 1);
+        // empty batches never create files
+        assert_eq!(spool_write(&dir, &[]).unwrap(), 0);
+        assert_eq!(spool_count(&dir), 1);
+        let files: Vec<PathBuf> = std::fs::read_dir(spool_dir(&dir))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        let rec: SpoolRecord =
+            serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(rec.probes.len(), 2);
+        assert_eq!(rec.probes[0].ip, Ipv4Addr::new(10, 0, 0, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

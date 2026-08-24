@@ -159,6 +159,15 @@ pub fn run(p: Params) -> Result<()> {
     });
     let url = format!("http://{addr}");
     println!("[*] NMS control panel: {url}");
+    let pending = crate::ops::spool_count(&p.out_dir);
+    if pending > 0 {
+        println!("[*] {pending} spooled cycle(s) pending replay");
+    }
+    match crate::ops::replay_spool(&shared.store, &p.out_dir) {
+        Ok(n) if n > 0 => println!("[*] replayed {n} spooled cycle(s)"),
+        Ok(_) => {}
+        Err(e) => eprintln!("[!] spool replay failed: {e}"),
+    }
     if hardened {
         println!("[*] auth mode: HARDENED (non-loopback bind or auth_mode=hardened)");
     } else {
