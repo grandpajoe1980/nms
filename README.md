@@ -12,8 +12,28 @@ suppression, performance history, uptime accounting, event management, audit
 logging, SLA-style reporting, and an outbound webhook queue ready for
 ServiceNow.
 
-No login, no accounts: every console page and API is unauthenticated by design.
-Put it behind your own reverse proxy if you need access control.
+No login, no accounts by design **in the default `open` mode** (loopback lab/home use).
+Hardened mode is available when you expose the console beyond loopback — see below.
+
+## Auth modes (open vs hardened)
+
+- `nms serve` binds `127.0.0.1` and runs in **open** mode: every page and API is unauthenticated.
+- Binding any non-loopback address (`nms serve --bind 0.0.0.0`) or setting
+  `auth_mode=hardened` (Settings page, requires restart) enables **hardened mode**:
+  - local users with Argon2id-hashed passwords, 7-day session cookies,
+    API bearer tokens stored hashed;
+  - roles `viewer` (read) < `operator` (run checks/diagnostics/ack) <
+    `admin` (discover/settings/webhook/remove); plus role `automation`
+    (API-token equivalent of operator, never console pages);
+  - unauthenticated requests get `401` (APIs) or a redirect to `/login` (pages);
+    `/api/health` and `/api/openapi.json` stay public for operability.
+- Bootstrap an admin and a token:
+
+```
+nms user add joe --role admin        # prompts for password
+nms token add ansible --role automation
+nms serve --bind 0.0.0.0
+```
 
 ## Feature map
 

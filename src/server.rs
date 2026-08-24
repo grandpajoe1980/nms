@@ -18,6 +18,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct Params {
     pub port: u16,
+    pub bind: String,
     pub no_open: bool,
     pub interval_secs: u64,
     pub extra_subnets: Vec<Ipv4Net>,
@@ -51,6 +52,73 @@ struct Shared {
     store: Arc<crate::db::Db>,
     last_stats: Mutex<Option<crate::ops::CycleStats>>,
     started_ts: i64,
+    hardened: bool,
+}
+
+/// Resolve the authenticated role for a request, if any.
+/// Bearer tokens (automation) and session cookies both hash to stored values.
+fn resolve_role(shared: &Shared, authorization: Option<&str>, cookie: Option<&str>) -> Option<String> {
+    let conn = shared.store.lock();
+    if let Some(header) = authorization {
+        let raw = header.strip_prefix("Bearer ").map(str::trim).filter(|s| !s.is_empty());
+        if let Some(raw) = raw {
+            let hashed = crate::auth::token_hash(raw);
+            if let Ok(Some(role)) = db::api_token_role(&conn, &hashed) {
+                return Some(role);
+            }
+        }
+    }
+    let raw = cookie
+        .and_then(|c| c.split(';').find_map(|part| part.trim().strip_prefix("nms_session=")))
+        .filter(|s| !s.is_empty())?;
+    db::session_role(&conn, &crate::auth::token_hash(raw)).ok().flatten()
+}
+
+fn login_page(err: Option<&str>) -> Vec<u8> {
+    let err_html = err
+        .map(|e| format!(r#"<div class="err">{}</div>"#, crate::ui::esc(e)))
+        .unwrap_or_default();
+    html(
+        "200 OK",
+        format!(
+            r#"<!doctype html><html><head><meta charset="utf-8"><title>NMS login</title><style>
+body{{background:#0b1020;color:#dbe4f5;font:14px system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}}
+form{{background:#0e1730;border:1px solid #22304f;padding:26px;border-radius:10px;display:flex;flex-direction:column;gap:10px;width:300px}}
+input{{background:#0b1220;color:#dbe4f5;border:1px solid #22304f;padding:8px;border-radius:6px}}
+button{{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:9px;cursor:pointer}}
+.err{{color:#ff5470;font-size:12px}}</style></head><body>
+<form method="post" action="/login"><b>NMS</b>{err_html}
+<input name="username" placeholder="username" autofocus>
+<input name="password" type="password" placeholder="password">
+<button>sign in</button></form></body></html>"#
+        ),
+    )
+}
+
+/// Render a response that sets a session cookie (login success).
+fn session_response(raw_token: &str, max_age_secs: i64) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: nms_session={raw}; Path=/; Max-Age={age}; HttpOnly; SameSite=Lax\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        raw = raw_token,
+        age = max_age_secs
+    )
+    .into_bytes()
+}
+
+fn unauthorized(api: bool) -> Vec<u8> {
+    if api {
+        json("401 Unauthorized", serde_json::json!({"error": "authentication required"}))
+    } else {
+        see_other("/login")
+    }
+}
+
+fn forbidden(api: bool) -> Vec<u8> {
+    if api {
+        json("403 Forbidden", serde_json::json!({"error": "insufficient role"}))
+    } else {
+        text("403 Forbidden", "insufficient role for this action".into())
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -64,7 +132,17 @@ struct Event {
 }
 
 pub fn run(p: Params) -> Result<()> {
-    let addr = format!("127.0.0.1:{}", p.port);
+    let bind_ip: std::net::IpAddr = p
+        .bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --bind '{}': {e}", p.bind))?;
+    let hardened = !bind_ip.is_loopback()
+        || db::get_setting_or(
+            &crate::db::Db::open(&p.out_dir.join("ops.db"))?.lock(),
+            "auth_mode",
+            "open",
+        ) == "hardened";
+    let addr = format!("{}:{}", p.bind, p.port);
     let listener = TcpListener::bind(&addr)?;
     let store = Arc::new(crate::db::Db::open(&p.out_dir.join("ops.db"))?);
     let shared = Arc::new(Shared {
@@ -76,10 +154,16 @@ pub fn run(p: Params) -> Result<()> {
         events: Mutex::new(VecDeque::new()),
         last_stats: Mutex::new(None),
         started_ts: chrono::Utc::now().timestamp(),
+        hardened,
         store,
     });
     let url = format!("http://{addr}");
     println!("[*] NMS control panel: {url}");
+    if hardened {
+        println!("[*] auth mode: HARDENED (non-loopback bind or auth_mode=hardened)");
+    } else {
+        println!("[*] auth mode: open (no login required)");
+    }
     println!("[*] Ctrl+C stops the web server and any in-process monitor loop");
     crate::jobs::start_housekeeping(Arc::clone(&shared.store));
     crate::jobs::start_webhook_sender(Arc::clone(&shared.store));
@@ -111,18 +195,22 @@ fn handle(stream: TcpStream, shared: Arc<Shared>, p: Params) {
         return;
     }
     let mut content_length = 0usize;
+    let mut cookie: Option<String> = None;
+    let mut authorization: Option<String> = None;
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
             Ok(0) | Err(_) => break,
             Ok(_) if header == "\r\n" || header == "\n" => break,
             Ok(_) => {
-                if let Some(v) = header
-                    .to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                    .and_then(|s| s.trim().parse().ok())
-                {
-                    content_length = v;
+                let lower = header.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                } else if lower.starts_with("cookie:") {
+                    cookie = header.split_once(':').map(|(_, v)| v.trim().to_string());
+                } else if lower.starts_with("authorization:") {
+                    authorization =
+                        header.split_once(':').map(|(_, v)| v.trim().to_string());
                 }
             }
         }
@@ -138,7 +226,30 @@ fn handle(stream: TcpStream, shared: Arc<Shared>, p: Params) {
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let response = route(method, path, query, &body, &shared, &p);
+
+    // Hardened-mode enforcement gate (FR-PLAT-005).
+    if shared.hardened {
+        if let Some((rank, is_api)) = crate::auth::requirement(method, path) {
+            match resolve_role(&shared, authorization.as_deref(), cookie.as_deref()) {
+                None => {
+                    let _ = writer.write_all(&unauthorized(is_api));
+                    let _ = writer.flush();
+                    return;
+                }
+                Some(role_str) => {
+                    let role = crate::auth::Role::parse(&role_str)
+                        .unwrap_or(crate::auth::Role::Viewer);
+                    if !crate::auth::authorized(role, is_api, rank) {
+                        let _ = writer.write_all(&forbidden(is_api));
+                        let _ = writer.flush();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    let response = route(method, path, query, &body, cookie.as_deref(), &shared, &p);
     let _ = writer.write_all(&response);
     let _ = writer.flush();
 }
@@ -177,7 +288,7 @@ fn html(status: &str, page: String) -> Vec<u8> {
     response(status, "text/html; charset=utf-8", page.into_bytes())
 }
 
-fn route(method: &str, path: &str, query: &str, body: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
+fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => map_page(shared, p),
         ("GET", "/map") => map_page(shared, p),
@@ -230,6 +341,35 @@ fn route(method: &str, path: &str, query: &str, body: &str, shared: &Arc<Shared>
         ("POST", "/api/trace") => trace_endpoint(query, shared),
         ("GET", "/api/health") => health_endpoint(shared),
         ("GET", "/api/openapi.json") => json("200 OK", openapi_spec()),
+        ("GET", "/login") => login_page(None),
+        ("POST", "/login") => {
+            let username = form_value(body, "username").unwrap_or_default();
+            let password = form_value(body, "password").unwrap_or_default();
+            let user = db::get_user(&shared.store.lock(), &username)
+                .ok()
+                .flatten()
+                .filter(|u| !u.disabled);
+            match user {
+                Some(u) if crate::auth::verify_password(&password, &u.password_hash) => {
+                    let (raw, hashed) = crate::auth::new_token();
+                    let expires = chrono::Utc::now().timestamp() + 7 * 86_400;
+                    let _ = db::create_session(&shared.store.lock(), &hashed, u.id, &u.role, expires);
+                    db::audit(&shared.store.lock(), &format!("web:{}", u.username), "auth.login", &u.username, "");
+                    session_response(&raw, 7 * 86_400)
+                }
+                _ => {
+                    db::audit(&shared.store.lock(), "web:anonymous", "auth.failure", &username, "");
+                    login_page(Some("invalid username or password"))
+                }
+            }
+        }
+        ("POST", "/logout") => {
+            if let Some(raw) = cookie.and_then(|c| c.split(';').find_map(|p| p.trim().strip_prefix("nms_session="))) {
+                let hashed = crate::auth::token_hash(raw);
+                let _ = db::delete_session(&shared.store.lock(), &hashed);
+            }
+            see_other("/login")
+        }
         ("GET", "/api/dashboard.json") => dashboard_json(shared),
         _ if method == "GET" && path.starts_with("/device/") && !path.ends_with(".json") => {
             let ip = url_decode(path.trim_start_matches("/device/"));
@@ -691,8 +831,9 @@ fn openapi_spec() -> serde_json::Value {
         "info": {
             "title": "nms-ng API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Unauthenticated embedded API (auth modes arrive in M1 hardened mode). \
-                            Webhook payload contract v1 is frozen per PRD §4.3."
+            "description": "Embedded API. In hardened mode (non-loopback bind or auth_mode=hardened) \
+                            requests require a session cookie or Bearer token; /api/health and \
+                            /api/openapi.json stay public. Webhook payload contract v1 is frozen per PRD §4.3."
         },
         "servers": [{ "url": "/", "description": "same origin" }],
         "paths": paths,
@@ -1078,6 +1219,7 @@ mod tests {
             store: Arc::new(crate::db::Db::open_memory().unwrap()),
             last_stats: Mutex::new(None),
             started_ts: chrono::Utc::now().timestamp(),
+            hardened: false,
         })
     }
 

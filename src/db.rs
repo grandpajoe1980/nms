@@ -265,6 +265,28 @@ CREATE TABLE IF NOT EXISTS device_diag(
   open_ports TEXT,
   method    TEXT
 );
+CREATE TABLE IF NOT EXISTS users(
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  username      TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  disabled      INTEGER NOT NULL DEFAULT 0,
+  created_ts    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions(
+  token_hash TEXT PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  role       TEXT NOT NULL,
+  created_ts INTEGER NOT NULL,
+  expires_ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_tokens(
+  token_hash TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  role       TEXT NOT NULL,
+  disabled   INTEGER NOT NULL DEFAULT 0,
+  created_ts INTEGER NOT NULL
+);
 "#;
 
 // ---------------------------------------------------------------- settings
@@ -1021,6 +1043,118 @@ pub fn epoch_day(ts: i64) -> i64 {
     ts - ts.rem_euclid(86_400)
 }
 
+// ------------------------------------------------------------------- auth
+
+pub struct UserRec {
+    pub id: i64,
+    pub username: String,
+    pub password_hash: String,
+    pub role: String,
+    pub disabled: bool,
+}
+
+pub fn create_user(conn: &Connection, username: &str, password_hash: &str, role: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO users(username, password_hash, role, created_ts) VALUES (?1, ?2, ?3, ?4)",
+        params![username, password_hash, role, now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_user(conn: &Connection, username: &str) -> Result<Option<UserRec>> {
+    let res = conn
+        .query_row(
+            "SELECT id, username, password_hash, role, disabled FROM users WHERE username = ?1",
+            params![username],
+            |r| {
+                Ok(UserRec {
+                    id: r.get(0)?,
+                    username: r.get(1)?,
+                    password_hash: r.get(2)?,
+                    role: r.get(3)?,
+                    disabled: r.get::<_, i64>(4)? != 0,
+                })
+            },
+        )
+        .optional()?;
+    Ok(res)
+}
+
+pub fn list_users(conn: &Connection) -> Result<Vec<(String, String, bool)>> {
+    let mut stmt = conn.prepare("SELECT username, role, disabled FROM users ORDER BY username")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? != 0))
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub fn set_user_disabled(conn: &Connection, username: &str, disabled: bool) -> Result<usize> {
+    conn.execute(
+        "UPDATE users SET disabled = ?2 WHERE username = ?1",
+        params![username, disabled as i64],
+    )
+    .map_err(Into::into)
+}
+
+pub fn create_session(
+    conn: &Connection,
+    token_hash: &str,
+    user_id: i64,
+    role: &str,
+    expires_ts: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sessions(token_hash, user_id, role, created_ts, expires_ts) VALUES (?1,?2,?3,?4,?5)",
+        params![token_hash, user_id, role, now(), expires_ts],
+    )?;
+    Ok(())
+}
+
+/// Returns the session's role if a live (unexpired) session exists for `token_hash`.
+pub fn session_role(conn: &Connection, token_hash: &str) -> Result<Option<String>> {
+    let res: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT u.role, s.expires_ts FROM sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ?1 AND u.disabled = 0",
+            params![token_hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match res {
+        Some((role, expires)) if expires > now() => Ok(Some(role)),
+        _ => Ok(None),
+    }
+}
+
+pub fn delete_session(conn: &Connection, token_hash: &str) -> Result<()> {
+    conn.execute("DELETE FROM sessions WHERE token_hash = ?1", params![token_hash])?;
+    Ok(())
+}
+
+pub fn prune_expired_sessions(conn: &Connection) -> Result<usize> {
+    conn.execute("DELETE FROM sessions WHERE expires_ts < ?1", params![now()])
+        .map_err(Into::into)
+}
+
+pub fn add_api_token(conn: &Connection, token_hash: &str, name: &str, role: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO api_tokens(token_hash, name, role, created_ts) VALUES (?1, ?2, ?3, ?4)",
+        params![token_hash, name, role, now()],
+    )?;
+    Ok(())
+}
+
+pub fn api_token_role(conn: &Connection, token_hash: &str) -> Result<Option<String>> {
+    let res: Option<String> = conn
+        .query_row(
+            "SELECT role FROM api_tokens WHERE token_hash = ?1 AND disabled = 0",
+            params![token_hash],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(res)
+}
+
 // ------------------------------------------------------------------- diag
 
 #[allow(clippy::too_many_arguments)]
@@ -1257,5 +1391,34 @@ mod tests {
         audit(&c, "web", "event.ack", "event:3", "{}");
         let n: i64 = c.query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn session_expiry_and_disabled_user() {
+        let db = setup();
+        let c = db.lock();
+        let uid = create_user(&c, "alice", "hash", "operator").unwrap();
+        // expired session
+        create_session(&c, "expired", uid, "operator", 100).unwrap();
+        assert!(session_role(&c, "expired").unwrap().is_none());
+        // live session
+        create_session(&c, "live", uid, "operator", 9_999_999_999).unwrap();
+        assert_eq!(session_role(&c, "live").unwrap().as_deref(), Some("operator"));
+        // disabled user invalidates live sessions
+        set_user_disabled(&c, "alice", true).unwrap();
+        assert!(session_role(&c, "live").unwrap().is_none());
+        // pruning removes only expired rows — the live session survives
+        prune_expired_sessions(&c).unwrap();
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn api_token_roles() {
+        let db = setup();
+        let c = db.lock();
+        add_api_token(&c, "h1", "ansible", "automation").unwrap();
+        assert_eq!(api_token_role(&c, "h1").unwrap().as_deref(), Some("automation"));
+        assert!(api_token_role(&c, "missing").unwrap().is_none());
     }
 }

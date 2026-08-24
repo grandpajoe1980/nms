@@ -48,6 +48,7 @@ pub fn start_housekeeping(dbh: Arc<Db>) {
                 Err(e) => eprintln!("[jobs] retention failed: {e}"),
             }
             let _ = db::purge_sent_outbound(&conn, now - 7 * 86_400);
+            let _ = db::prune_expired_sessions(&conn);
             drop(conn);
             std::thread::sleep(Duration::from_secs(600));
         })

@@ -15,6 +15,8 @@ if-addrs = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 dns-lookup = "2"
+argon2 = "0.5"
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 socket2 = "0.5"

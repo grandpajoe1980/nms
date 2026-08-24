@@ -1,4 +1,5 @@
 mod arp;
+mod auth;
 mod check;
 mod db;
 mod diag;
@@ -25,6 +26,43 @@ use ipnet::Ipv4Net;
 use model::{Model, Role, State};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[derive(Subcommand)]
+enum UserAction {
+    Add {
+        username: String,
+        #[arg(long, default_value = "operator")]
+        role: String,
+        #[arg(long, help = "password (visible in process list; prefer interactive prompt)")]
+        password: Option<String>,
+        #[arg(long, default_value = "output")]
+        out: PathBuf,
+    },
+    List {
+        #[arg(long, default_value = "output")]
+        out: PathBuf,
+    },
+    Disable {
+        username: String,
+        #[arg(long, default_value = "output")]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    Add {
+        name: String,
+        #[arg(long, default_value = "automation")]
+        role: String,
+        #[arg(long, default_value = "output")]
+        out: PathBuf,
+    },
+    List {
+        #[arg(long, default_value = "output")]
+        out: PathBuf,
+    },
+}
 
 #[derive(Parser)]
 #[command(
@@ -119,6 +157,8 @@ enum Cmd {
     Serve {
         #[arg(long, default_value_t = 8765)]
         port: u16,
+        #[arg(long, default_value = "127.0.0.1", help = "bind address (non-loopback forces hardened auth)")]
+        bind: String,
         #[arg(long, help = "do not open the browser automatically")]
         no_open: bool,
         #[arg(long, default_value_t = 60, help = "monitor loop interval when started from the UI")]
@@ -127,6 +167,16 @@ enum Cmd {
         subnets: Option<Vec<String>>,
         #[arg(long, default_value = "output")]
         out: PathBuf,
+    },
+    #[command(about = "manage local users for hardened mode")]
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
+    #[command(about = "manage API bearer tokens for automation")]
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
     },
     #[command(about = "print the IPv4 routing table as seen by the scanner")]
     Routes,
@@ -310,14 +360,85 @@ fn main() -> Result<()> {
             std::fs::write(&dest, html)?;
             println!("[*] wrote {}", dest.display());
         }
-        Cmd::Serve { port, no_open, interval_secs, subnets, out } => {
+        Cmd::Serve { port, bind, no_open, interval_secs, subnets, out } => {
             server::run(server::Params {
                 port,
+                bind,
                 no_open,
                 interval_secs,
                 extra_subnets: parse_subnets(subnets)?,
                 out_dir: out,
             })?;
+        }
+        Cmd::User { action } => match action {
+            UserAction::Add { username, role, password, out } => {
+                auth::Role::parse(&role)?;
+                let pass = match password {
+                    Some(p) => p,
+                    None => {
+                        print!("password for {username}: ");
+                        use std::io::Write as _;
+                        std::io::stdout().flush()?;
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line)?;
+                        line.trim().to_string()
+                    }
+                };
+                if pass.len() < 8 {
+                    bail!("password must be at least 8 characters");
+                }
+                let store = db::Db::open(&out.join("ops.db"))?;
+                let c = store.lock();
+                if db::get_user(&c, &username)?.is_some() {
+                    bail!("user '{username}' already exists");
+                }
+                let hash = auth::hash_password(&pass)?;
+                let id = db::create_user(&c, &username, &hash, &role)?;
+                drop(c);
+                println!("[+] created user '{username}' (role={role}, id={id})");
+            }
+            UserAction::List { out } => {
+                let store = db::Db::open(&out.join("ops.db"))?;
+                let c = store.lock();
+                for (name, role, disabled) in db::list_users(&c)? {
+                    println!("{name:<24} {role:<12} {}", if disabled { "disabled" } else { "active" });
+                }
+            }
+            UserAction::Disable { username, out } => {
+                let store = db::Db::open(&out.join("ops.db"))?;
+                let n = db::set_user_disabled(&store.lock(), &username, true)?;
+                if n == 0 {
+                    bail!("no such user '{username}'");
+                }
+                println!("[+] disabled '{username}'");
+            }
+        },
+        Cmd::Token { action } => match action {
+            TokenAction::Add { name, role, out } => {
+                auth::Role::parse(&role)?;
+                let (raw, hashed) = auth::new_token();
+                let store = db::Db::open(&out.join("ops.db"))?;
+                db::add_api_token(&store.lock(), &hashed, &name, &role)?;
+                println!("[+] token '{name}' created (role={role})");
+                println!("    raw token (shown once, stored hashed): {raw}");
+            }
+            TokenAction::List { out } => {
+                let store = db::Db::open(&out.join("ops.db"))?;
+                let c = store.lock();
+                let mut stmt = c.prepare("SELECT name, role, disabled, created_ts FROM api_tokens ORDER BY name")?;
+                for row in stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+                })? {
+                    let (name, role, disabled, ts) = row?;
+                    println!(
+                        "{name:<24} {role:<12} {} created {}",
+                        if disabled != 0 { "disabled" } else { "active" },
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+                            .map(|d| d.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default()
+                    );
+                }
+            }
         }
         Cmd::Routes => {
             let rt = routes::read();
