@@ -17,12 +17,13 @@ Statuses: OPEN | IN-PROGRESS | DONE (<commit>) | BLOCKED (<reason>)
 
 ## M2 — StableNet core parity (current milestone)
 
-### T-002 · SSH transport for config backups · agent: config-builder · OPEN
+### T-002 · SSH transport for config backups · agent: config-builder · DONE (pending commit hash)
 - FRs: CFG-002/003. Scope: `crates/engine/src/cfgmod.rs` + new driver module;
   add `russh` (or `ssh2`) behind a Cargo feature; wire into discovery-enriched
   devices with `snmp`-style opt-in flag `--config-backup`.
 - AC: recorded-session fixture test pulls a fake config, stores snapshot,
-  produces unified diff vs previous; no credentials in logs.
+  produces unified diff vs previous; no credentials in logs. Delivered as an
+  opt-in dedicated `inspect` enrichment pass; no config push.
 
 ### T-003 · GETBULK consumers in engine · agent: snmp-collector-builder · OPEN
 - FRs: PRF-003, DISC-003. Scope: replace per-column ifTable walks with

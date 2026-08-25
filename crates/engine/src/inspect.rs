@@ -10,7 +10,7 @@ use crate::model::State;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -19,7 +19,21 @@ pub struct InspectStats {
     pub snmp_ok: usize,
     pub interfaces: usize,
     pub neighbors: usize,
+    pub config_ok: usize,
+    pub config_changed: usize,
+    pub config_failed: usize,
     pub duration_ms: u64,
+}
+
+/// Non-secret SSH references used only by the opt-in config enrichment pass.
+#[derive(Clone, Debug)]
+pub struct ConfigBackupRequest {
+    pub username: String,
+    pub key_path: PathBuf,
+    pub known_hosts_path: PathBuf,
+    pub port: u16,
+    pub timeout_ms: u64,
+    pub profile: crate::config_driver::ConfigProfile,
 }
 
 /// Run `f` over (absolute_index, item) pairs width-wide in parallel,
@@ -58,8 +72,26 @@ pub fn run(
     port: u16,
     max_devices: usize,
 ) -> Result<InspectStats> {
+    run_with_config(dbh, out_dir, community, timeout_ms, port, max_devices, None)
+}
+
+/// Run inspection and, when requested, the separate read-only SSH config
+/// enrichment pass. SSH is deliberately not part of discovery or SNMP work.
+pub fn run_with_config(
+    dbh: &Arc<Db>,
+    out_dir: &Path,
+    community: &str,
+    timeout_ms: u64,
+    port: u16,
+    max_devices: usize,
+    config_request: Option<ConfigBackupRequest>,
+) -> Result<InspectStats> {
     let t0 = std::time::Instant::now();
     let mut stats = InspectStats::default();
+
+    if config_request.is_some() && !crate::config_driver::ssh_feature_enabled() {
+        anyhow::bail!("--config-backup requires an nms build with the `ssh` feature enabled");
+    }
 
     let mut model = crate::model::Model::load(&out_dir.join("model.json"))?;
     let targets: Vec<(usize, std::net::Ipv4Addr)> = model
@@ -182,6 +214,41 @@ pub fn run(
     }
     for _ in 0..total {
         crate::progress::tick(1);
+    }
+
+    // ---- optional phase 4: read-only SSH config backup + diff
+    if let Some(request) = config_request {
+        for &(_, ip) in &targets {
+            let options = crate::config_driver::SshConfigOptions {
+                host: std::net::IpAddr::V4(ip),
+                port: request.port,
+                username: request.username.clone(),
+                key_path: request.key_path.clone(),
+                known_hosts_path: request.known_hosts_path.clone(),
+                timeout_ms: request.timeout_ms,
+                profile: request.profile,
+            };
+            match crate::config_driver::read_config_raw(&options)
+                .and_then(|raw| {
+                    let normalized = crate::config_driver::extract_config(request.profile, &raw)?;
+                    crate::cfgmod::save_backup(
+                        out_dir,
+                        &ip.to_string(),
+                        chrono::Utc::now().timestamp(),
+                        &raw,
+                        &normalized,
+                    )
+                    .map_err(|_| crate::config_driver::ConfigReadError::OutputInvalid)
+                }) {
+                Ok(result) => {
+                    stats.config_ok += 1;
+                    if result.changed {
+                        stats.config_changed += 1;
+                    }
+                }
+                Err(_) => stats.config_failed += 1,
+            }
+        }
     }
     crate::progress::clear();
 

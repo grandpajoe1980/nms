@@ -137,6 +137,20 @@ enum Cmd {
         port: u16,
         #[arg(long, default_value_t = 0, help = "cap devices inspected (0 = all live)")]
         max_devices: usize,
+        #[arg(long, help = "opt in to read-only SSH config backup during inspect")]
+        config_backup: bool,
+        #[arg(long, requires = "config_backup", help = "SSH username (non-secret reference)")]
+        ssh_username: Option<String>,
+        #[arg(long, requires = "config_backup", help = "path to SSH private key (reference only)")]
+        ssh_key: Option<PathBuf>,
+        #[arg(long, requires = "config_backup", help = "path to strict SSH known_hosts file")]
+        ssh_known_hosts: Option<PathBuf>,
+        #[arg(long, default_value_t = 22, requires = "config_backup")]
+        ssh_port: u16,
+        #[arg(long, default_value_t = 5000, requires = "config_backup")]
+        ssh_timeout_ms: u64,
+        #[arg(long, default_value = "cisco-ios-xe", requires = "config_backup", help = "config command profile: cisco-ios-xe|aruba-aos-cx")]
+        config_profile: String,
         #[arg(long, default_value = "output")]
         out: PathBuf,
     },    #[command(about = "regenerate map.html from the stored model")]
@@ -342,12 +356,41 @@ fn main() -> Result<()> {
                 exec,
             })?;
         }
-        Cmd::Inspect { community, timeout_ms, port, max_devices, out } => {
+        Cmd::Inspect {
+            community,
+            timeout_ms,
+            port,
+            max_devices,
+            config_backup,
+            ssh_username,
+            ssh_key,
+            ssh_known_hosts,
+            ssh_port,
+            ssh_timeout_ms,
+            config_profile,
+            out,
+        } => {
             let store = Arc::new(engine::db::Db::open(&out.join("ops.db"))?);
-            let stats = engine::inspect::run(&store, &out, &community, timeout_ms, port, max_devices)?;
+            let config_request = if config_backup {
+                let username = ssh_username.ok_or_else(|| anyhow::anyhow!("--ssh-username is required with --config-backup"))?;
+                let key_path = ssh_key.ok_or_else(|| anyhow::anyhow!("--ssh-key is required with --config-backup"))?;
+                let known_hosts_path = ssh_known_hosts.ok_or_else(|| anyhow::anyhow!("--ssh-known-hosts is required with --config-backup"))?;
+                Some(engine::inspect::ConfigBackupRequest {
+                    username,
+                    key_path,
+                    known_hosts_path,
+                    port: ssh_port,
+                    timeout_ms: ssh_timeout_ms,
+                    profile: config_profile.parse().map_err(|e| anyhow::anyhow!("{e}"))?,
+                })
+            } else {
+                None
+            };
+            let stats = engine::inspect::run_with_config(&store, &out, &community, timeout_ms, port, max_devices, config_request)?;
             println!(
-                "[+] inspect: {} device(s) | snmp {} | interfaces {} | neighbors {} | {} ms",
-                stats.devices, stats.snmp_ok, stats.interfaces, stats.neighbors, stats.duration_ms
+                "[+] inspect: {} device(s) | snmp {} | interfaces {} | neighbors {} | configs ok={} changed={} failed={} | {} ms",
+                stats.devices, stats.snmp_ok, stats.interfaces, stats.neighbors,
+                stats.config_ok, stats.config_changed, stats.config_failed, stats.duration_ms
             );
         }
         Cmd::Map { out } => {

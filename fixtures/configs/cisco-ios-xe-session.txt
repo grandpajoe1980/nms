@@ -1,0 +1,15 @@
+edge-r1# terminal length 0
+edge-r1# terminal width 0
+edge-r1# show running-config
+--- BEGIN CONFIG ---
+!
+hostname edge-r1
+version 17.9
+!
+interface GigabitEthernet1
+ description uplink
+ ip address 192.0.2.1 255.255.255.0
+!
+end
+--- END CONFIG ---
+edge-r1#

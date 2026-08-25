@@ -108,6 +108,69 @@ pub fn save_snapshot(out_dir: &Path, snap: &ConfigSnapshot) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Result of persisting a read-only config backup.  The normalized snapshot
+/// is the canonical `.cfg`; raw transport output is retained alongside it.
+#[derive(Clone, Debug)]
+pub struct ConfigBackupResult {
+    pub snapshot_path: PathBuf,
+    pub raw_path: PathBuf,
+    pub previous_snapshot_path: Option<PathBuf>,
+    pub diff_path: Option<PathBuf>,
+    pub unified_diff: Vec<String>,
+    pub changed: bool,
+}
+
+/// Persist normalized and raw config text and calculate a deterministic diff
+/// against the previous snapshot before writing the new one.
+pub fn save_backup(
+    out_dir: &Path,
+    device_ip: &str,
+    collected_ts: i64,
+    raw: &str,
+    normalized: &str,
+) -> Result<ConfigBackupResult> {
+    let previous = latest_snapshot_path(out_dir, device_ip)?;
+    let unified_diff = match &previous {
+        Some(path) => unified_diff(&fs::read_to_string(path)?, normalized, 3),
+        None => Vec::new(),
+    };
+    let snapshot = ConfigSnapshot {
+        device_ip: device_ip.to_string(),
+        collected_ts,
+        raw_sha256: String::new(),
+        content: normalized.to_string(),
+    };
+    let snapshot_path = save_snapshot(out_dir, &snapshot)?;
+    let raw_path = snapshot_path.with_file_name(format!(
+        "{}.raw.cfg",
+        snapshot_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("snapshot")
+    ));
+    if !raw_path.exists() {
+        fs::write(&raw_path, raw).with_context(|| format!("write raw snapshot {}", raw_path.display()))?;
+    }
+    let diff_path = if previous.is_some() && !unified_diff.is_empty() {
+        let path = snapshot_path.with_extension("diff");
+        if !path.exists() {
+            fs::write(&path, format!("{}\n", unified_diff.join("\n")))
+                .with_context(|| format!("write config diff {}", path.display()))?;
+        }
+        Some(path)
+    } else {
+        None
+    };
+    Ok(ConfigBackupResult {
+        snapshot_path,
+        raw_path,
+        previous_snapshot_path: previous,
+        diff_path,
+        changed: !unified_diff.is_empty(),
+        unified_diff,
+    })
+}
+
 /// Newest snapshot for a device, by `collected_ts` from sidecar metadata.
 /// Ties broken deterministically by sha256. Returns `None` when the device
 /// has no snapshots.
@@ -511,5 +574,36 @@ mod tests {
         assert_eq!(changed_lines_count("l1\nl2\nl3", ""), 3);
         // Trailing newline must not count as an extra line.
         assert_eq!(changed_lines_count("a\n", "a"), 0);
+    }
+
+    #[test]
+    fn backup_persists_raw_and_previous_unified_diff() {
+        let out = tempfile::tempdir().unwrap();
+        let first = save_backup(
+            out.path(),
+            "192.0.2.10",
+            1_700_000_000,
+            "prompt# show running-config\r\nhostname edge\r\nend\r\n",
+            "hostname edge\nend\n",
+        )
+        .unwrap();
+        assert!(!first.changed);
+        assert!(first.previous_snapshot_path.is_none());
+        assert!(first.raw_path.is_file());
+
+        let second = save_backup(
+            out.path(),
+            "192.0.2.10",
+            1_700_086_400,
+            "prompt# show running-config\r\nhostname edge\r\nntp server pool\r\nend\r\n",
+            "hostname edge\nntp server pool\nend\n",
+        )
+        .unwrap();
+        assert!(second.changed);
+        assert!(second.previous_snapshot_path.is_some());
+        assert!(second.diff_path.as_ref().is_some_and(|path| path.is_file()));
+        let diff = second.unified_diff.join("\n");
+        assert!(diff.contains("+ntp server pool"));
+        assert!(fs::read_to_string(second.raw_path).unwrap().contains("pool"));
     }
 }

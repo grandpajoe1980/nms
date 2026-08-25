@@ -1,0 +1,13 @@
+edge-sw1# no paging
+edge-sw1# show running-config
+--- BEGIN CONFIG ---
+!
+hostname edge-sw1
+!
+interface 1/1/1
+ description uplink
+ no shutdown
+!
+end
+--- END CONFIG ---
+edge-sw1#

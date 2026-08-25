@@ -52,7 +52,7 @@ performance, configuration management):
 | impact analysis | "depends on this device" listing straight on the device page |
 | inventory hygiene | devices unseen for `absent_retire_days` (default 30) are retired automatically; explicit remove button keeps the map clean today |
 | scheduled reporting | hourly 24h-availability snapshot + dated daily CSVs under `output/reports/` (90-day retention) |
-| configuration management | roadmap (SSH/SNMP config backup) — not yet implemented |
+| configuration management | opt-in `inspect --config-backup` SSH read-only snapshots for Cisco IOS-XE and Aruba AOS-CX (feature-gated), raw + normalized archives and unified diffs |
 | reporting | per-site availability % (24h/7d/30d), MTTR, avg RTT; HTML tables + CSV exports (site-level and per-device) |
 | audit | every user action (settings change, ack, site assign, maintenance toggle, webhook test) recorded with actor/time/details |
 | integration | outbound webhook queue with retries; JSON payload schema designed for ServiceNow Incident creation; test button |
@@ -63,6 +63,7 @@ performance, configuration management):
 nms discover [--subnets a.b.c.d/x,...] [options]   crawl + classify + build model + sync inventory
 nms check    [--subnets ...]       [options]       one sweep -> ops DB (samples, events, alerts)
 nms monitor  [--interval-secs 60]  [options]       loop checks forever (ops engine + exec hook)
+nms inspect  [--config-backup --ssh-username USER --ssh-key PATH --ssh-known-hosts PATH] [options]
 nms serve    [--port 8765]                         web console + map + monitoring controls
 nms map                                            regenerate output/map.html from model.json
 nms routes | ifaces | ping <ip>                    debug helpers
@@ -76,6 +77,13 @@ Outputs live in `--out` (default `output/`):
 | `map.html`   | standalone interactive topology map |
 | `ops.db`     | SQLite ops database: inventory, samples, rollups, segments, events, audit, outbound queue |
 | `alerts.log` | append-only DOWN alert lines (bell-prefixed on console too) |
+
+Config backup is deliberately opt-in and runs only during the dedicated
+`inspect` enrichment pass. Build with `cargo build -p nms --features ssh`, then
+provide a username plus private-key and known-hosts file references (key bytes
+and host-key contents are never accepted as arguments, logged, or returned by
+the API). Host keys must already be present and match the supplied known-hosts
+file; unknown or changed keys fail closed. No configuration push is implemented.
 
 ## The web console (`nms serve`)
 

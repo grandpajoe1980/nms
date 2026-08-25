@@ -7,6 +7,10 @@ edition.workspace = true
 name = "engine"
 path = "src/lib.rs"
 
+[features]
+default = []
+ssh = ["dep:russh", "dep:tokio"]
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
@@ -22,6 +26,8 @@ dns-lookup.workspace = true
 argon2.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+russh = { version = "0.63.1", optional = true, default-features = false, features = ["ring"] }
+tokio = { version = "1", optional = true, features = ["io-util", "net", "rt", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 socket2 = "0.5"
