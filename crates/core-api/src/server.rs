@@ -1483,6 +1483,45 @@ button{background:#2563eb;color:#fff;border:0;border-radius:7px;padding:10px 16p
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{MutexGuard, OnceLock};
+
+    static VAULT_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct VaultEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        key: Option<std::ffi::OsString>,
+        key_file: Option<std::ffi::OsString>,
+    }
+
+    impl VaultEnvGuard {
+        fn new() -> Self {
+            let lock = VAULT_ENV_LOCK.get_or_init(|| Mutex::new(())).lock();
+            let lock = match lock {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let key = std::env::var_os("NMS_VAULT_KEY");
+            let key_file = std::env::var_os("NMS_VAULT_KEY_FILE");
+            Self {
+                _lock: lock,
+                key,
+                key_file,
+            }
+        }
+    }
+
+    impl Drop for VaultEnvGuard {
+        fn drop(&mut self) {
+            match &self.key {
+                Some(value) => std::env::set_var("NMS_VAULT_KEY", value),
+                None => std::env::remove_var("NMS_VAULT_KEY"),
+            }
+            match &self.key_file {
+                Some(value) => std::env::set_var("NMS_VAULT_KEY_FILE", value),
+                None => std::env::remove_var("NMS_VAULT_KEY_FILE"),
+            }
+        }
+    }
 
     fn test_shared() -> Arc<Shared> {
         Arc::new(Shared {
@@ -1559,6 +1598,7 @@ mod tests {
 
     #[test]
     fn credential_api_is_write_only_and_audited() {
+        let _vault_env = VaultEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let mut p = test_params();
         p.out_dir = dir.path().to_path_buf();
@@ -1600,6 +1640,7 @@ mod tests {
 
     #[test]
     fn credential_gate_rejects_anonymous_and_operator_but_allows_admin() {
+        let _vault_env = VaultEnvGuard::new();
         let shared = test_shared();
         let dir = tempfile::tempdir().unwrap();
         let mut params = test_params();
