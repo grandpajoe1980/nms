@@ -68,7 +68,7 @@ pub fn run(
         .enumerate()
         .filter(|(_, d)| d.state == State::Up)
         .map(|(i, d)| (i, d.ip))
-        .take(max_devices.max(1))
+        .take(if max_devices == 0 { usize::MAX } else { max_devices })
         .collect();
     if targets.is_empty() {
         return Ok(stats);

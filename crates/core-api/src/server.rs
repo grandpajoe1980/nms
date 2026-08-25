@@ -1040,14 +1040,19 @@ fn start_job(shared: &Arc<Shared>, p: &Params, kind: Job) -> Vec<u8> {
 }
 
 fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
-    let _engine = shared.engine_lock.lock().unwrap();
+    // Poison-tolerant: a panic while holding these locks must not wedge the
+    // whole control plane (that was the "system locked up" failure mode).
+    let _engine = shared
+        .engine_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     set_message(&shared, &format!("{} running", kind.as_str()));
-    let result = match kind {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
         Job::Inspect => {
             let community = db::get_setting_or(&shared.store.lock(), "snmp_community", "public");
             engine::inspect::run(&shared.store, &p.out_dir, &community, 500, 161, 0).map(|stats| {
                 format!(
-                    "inspection complete: {} device(s) · snmp {} · interfaces {} · neighbors {} in {} ms",
+                    "inspection complete: {} device(s) | snmp {} | interfaces {} | neighbors {} | {} ms",
                     stats.devices, stats.snmp_ok, stats.interfaces, stats.neighbors,
                     stats.duration_ms
                 )
@@ -1104,15 +1109,28 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
             Err(e) => Err(e),
         },
         Job::Idle => unreachable!(),
+    }));
+
+    // Always release the job slot - even if the job body panicked.
+    *shared.job.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Job::Idle;
+
+    let message = match result {
+        Ok(Ok(message)) => {
+            shared.revision.fetch_add(1, Ordering::Relaxed);
+            message
+        }
+        Ok(Err(e)) => format!("{} failed: {e}", kind.as_str()),
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            format!("{} panicked: {detail}", kind.as_str())
+        }
     };
-    let changed = result.is_ok();
-    let message = result.unwrap_or_else(|e| format!("{} failed: {e}", kind.as_str()));
-    if changed {
-        shared.revision.fetch_add(1, Ordering::Relaxed);
-    }
     println!("[server] {message}");
     set_message(&shared, &message);
-    *shared.job.lock().unwrap() = Job::Idle;
 }
 
 fn check_params(p: &Params) -> check::Params {
