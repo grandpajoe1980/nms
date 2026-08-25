@@ -65,7 +65,7 @@ pub fn page(conn: &Connection, title: &str, active: &str, body: &str) -> String 
 <title>{title} \u{b7} NMS</title><style>{CSS}</style></head><body>\
 <div class=\"topbar\"><b>NMS</b>{nav}\
 <form method=\"get\" action=\"/devices\" style=\"margin-left:auto;display:flex;gap:6px\">\
-<input name=\"q\" placeholder=\"search ip/mac/host\u{2026}\" size=\"22\">\
+<input name=\"q\" placeholder=\"search ip/mac/host/site\u{2026}\" size=\"22\">\
 <button type=\"submit\">go</button></form>\
 <span class=\"muted\">\
 alerts <span style=\"color:var(--down)\">{open}</span> open / {unacked} unacked</span></div>\
@@ -210,6 +210,31 @@ pub fn dashboard(conn: &Connection) -> String {
     let sites: i64 =
         conn.query_row("SELECT COUNT(*) FROM sites", [], |r| r.get(0)).unwrap_or(0);
 
+    // Intent compliance summary (FR-INT-002): distinct intent ids are encoded
+    // in event kinds like `intent:intent_violation/<id>`.
+    let intent_total: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT kind) FROM events WHERE kind LIKE 'intent:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let intent_open: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT kind) FROM events WHERE kind LIKE 'intent:%' AND state='open'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let intent_ok = intent_total.saturating_sub(intent_open);
+    let intent_color = if intent_total == 0 {
+        "var(--dim)"
+    } else if intent_open == 0 {
+        "var(--up)"
+    } else {
+        "var(--down)"
+    };
+
     let trend: Vec<(i64, f64)> = conn
         .prepare(
             "SELECT hour, 100.0*SUM(ups)/MAX(SUM(probes),1) FROM rollup_hourly
@@ -254,10 +279,42 @@ pub fn dashboard(conn: &Connection) -> String {
 <div class=\"card\"><div class=\"n\" style=\"color:var(--down)\">{down}</div><div class=\"l\">down</div></div>\
 <div class=\"card\"><div class=\"n\" style=\"color:var(--warn)\">{unreach}</div><div class=\"l\">unreachable</div></div>\
 <div class=\"card\"><div class=\"n\" style=\"color:var(--warn)\">{degraded}</div><div class=\"l\">degraded</div></div>\
-<div class=\"card\"><div class=\"n\">{sites}</div><div class=\"l\">sites</div></div></div>",
+<div class=\"card\"><div class=\"n\">{sites}</div><div class=\"l\">sites</div></div>\
+<div class=\"card\" title=\"declarative intent checks passing; open violations are listed in Events (FR-INT-002)\">\
+<div class=\"n\" style=\"color:{intent_color}\">{intent_ok}/{intent_total}</div><div class=\"l\">intent compliance</div></div></div>",
         up = g("up"),
         down = g("down"),
-        unreach = g("unreachable"));
+        unreach = g("unreachable"),
+        intent_ok = intent_ok,
+        intent_total = intent_total,
+        intent_color = intent_color);
+
+    // Deep inspection trigger on the Console (FR-DISC-003/FR-DISC-004); the
+    // map page also offers it, but the dashboard should not send operators
+    // hunting for it. Polls /api/status in place, never location.reload().
+    body.push_str(
+        "<div class=\"panel\" style=\"margin-bottom:16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap\">\
+<button id=\"inspectbtn\">Inspect network</button>\
+<span class=\"muted\">deep pass on every live device: SNMP identity, ifTable, LLDP/CDP neighbors</span>\
+<span id=\"inspectmsg\" class=\"muted\"></span></div>\
+<script>
+const ib=document.getElementById('inspectbtn'),im=document.getElementById('inspectmsg');
+ib.onclick=async()=>{
+  ib.disabled=true;
+  im.textContent='inspection queued…';
+  try{
+    const r=await fetch('/api/inspect',{method:'POST'});
+    if(!r.ok){throw new Error((await r.text())||('HTTP '+r.status));}
+    const t=setInterval(async()=>{
+      try{
+        const s=await(await fetch('/api/status')).json();
+        im.textContent=s.message||s.job;
+        if(s.job==='idle'){clearInterval(t);ib.disabled=false;im.textContent='inspection complete';}
+      }catch(e){clearInterval(t);ib.disabled=false;im.textContent='lost track of job: '+e.message;}
+    },1500);
+  }catch(e){ib.disabled=false;im.textContent='inspect failed: '+e.message;}
+};
+</script>");
 
     let trend_chart = svg_line(&trend, 600, 140, "var(--up)", "%");
     let _ = write!(body,
@@ -305,7 +362,13 @@ pub fn devices_page(conn: &Connection, state: &str, q: &str) -> String {
     }
     if !q.trim().is_empty() {
         args.push(rusqlite::types::Value::Text(format!("%{}%", q.trim())));
-        sql.push_str(&format!(" AND (ip LIKE ?{0} OR COALESCE(mac,'') LIKE ?{0})", args.len()));
+        // FR-UX-004: search across ip, mac, hostname and site name.
+        sql.push_str(&format!(
+            " AND (ip LIKE ?{0} OR COALESCE(mac,'') LIKE ?{0} \
+             OR COALESCE(hostname,'') LIKE ?{0} \
+             OR (SELECT name FROM sites WHERE id = devices.site_id) LIKE ?{0})",
+            args.len()
+        ));
     }
     sql.push_str(" ORDER BY ip LIMIT 500");
     let rows: Vec<DeviceRow> = conn
@@ -450,6 +513,18 @@ pub fn device_detail(conn: &Connection, ip: &str) -> String {
 <input type=\"hidden\" name=\"ip\" value=\"{ip}\"><input type=\"hidden\" name=\"action\" value=\"remove\">\
 <button style=\"color:var(--down)\">remove from inventory</button></form></div>");
 
+    // Config backup + credential vault pointers (FR-CFG-001, FR-CFG-002).
+    // Snapshot store lives on disk, not in the DB: count sidecar files under
+    // the default output dir; a missing directory simply means zero backups.
+    if matches!(d.role.as_str(), "router" | "switch") {
+        let snaps = snapshot_count(std::path::Path::new("output"), ip);
+        let _ = write!(body,
+            "<p class=\"muted\" style=\"margin:6px 0 0\">Config backup: {snaps} snapshot(s) under \
+output/configs/{ip_esc}/ \u{2014} diffs render when CFG collection is enabled · \
+credentials: manage refs in the <a href=\"/settings\">credential vault</a></p>",
+            ip_esc = esc(ip));
+    }
+
     let _ = write!(body,
         "<div class=\"panel\" style=\"margin:10px 0\"><h2>Diagnostics</h2>\
 <button onclick=\"runDiag('{ip_js}')\">Run diagnostics</button> &nbsp;\
@@ -506,6 +581,70 @@ async function pingOne() {{
   }} catch (e) {{ document.getElementById('pingone').textContent = 'ping failed'; }}
 }}
 pingOne();
+</script>");
+
+    // Runbook bundles executable against this device (FR-PTH-003, FR-AUT-001).
+    // Bundle list and history are fetched client-side from the JSON API so
+    // the panel renders without any extra server-side data plumbing.
+    let _ = write!(body,
+        "<div class=\"panel\" style=\"margin:10px 0\"><h2>Runbooks</h2>\
+<div id=\"rbbtns\"></div>\
+<div id=\"rbout\" class=\"muted\" style=\"margin-top:8px\"></div>\
+<h3>Recent runs</h3><div id=\"rbruns\" class=\"muted\">loading\u{2026}</div></div>\
+<script>
+const RB_IP='{ip_js}';
+const rbColor = st => ({{ok:'var(--up)',failed:'var(--down)',running:'var(--warn)'}})[st]||'var(--dim)';
+function agoStr(ts) {{
+  const s = Math.max(0, Math.floor(Date.now()/1000) - ts);
+  return s < 90 ? s + 's ago' : s < 5400 ? Math.floor(s/60) + 'm ago' :
+    s < 172800 ? Math.floor(s/3600) + 'h ago' : Math.floor(s/86400) + 'd ago';
+}}
+async function rbLoad() {{
+  const wrap = document.getElementById('rbbtns');
+  const out = document.getElementById('rbout');
+  try {{
+    const list = await (await fetch('/api/runbooks.json')).json();
+    wrap.innerHTML = '';
+    if (!list.length) out.textContent = 'no runbook bundles installed (output/bundles/*.yml|json)';
+    for (const b of list) {{
+      const btn = document.createElement('button');
+      btn.textContent = b.title || b.name;
+      btn.title = 'steps: ' + (b.steps || []).join(', ');
+      btn.onclick = () => rbRun(b.name);
+      wrap.appendChild(btn);
+      wrap.appendChild(document.createTextNode(' '));
+    }}
+  }} catch (e) {{ out.textContent = 'runbooks unavailable: ' + e.message; }}
+}}
+async function rbRuns() {{
+  const el = document.getElementById('rbruns');
+  try {{
+    const d = await (await fetch('/api/runbook/runs.json?ip=' + encodeURIComponent(RB_IP) +
+      '&limit=5')).json();
+    const runs = d.runs || [];
+    if (!runs.length) {{ el.textContent = 'no runs recorded yet'; return; }}
+    let html = '<table><tr><th>when</th><th>bundle</th><th>status</th><th>run</th></tr>';
+    for (const r of runs) {{
+      html += '<tr><td class=\\'muted\\'>' + agoStr(r.started_ts) + '</td><td>' + escHtml(r.bundle) +
+        '</td><td><span style=\\'color:' + rbColor(r.status) + '\\'> ' + escHtml(r.status) +
+        '</span>' + (r.finished_ts ? '' : ' \u{2026}') + '</td><td>#' + r.id + '</td></tr>';
+    }}
+    el.innerHTML = html + '</table>';
+  }} catch (e) {{ el.textContent = 'recent runs unavailable'; }}
+}}
+async function rbRun(name) {{
+  const out = document.getElementById('rbout');
+  out.textContent = 'running ' + name + '\u{2026} read-only steps may take up to a minute';
+  try {{
+    const r = await fetch('/api/runbook/run?ip=' + encodeURIComponent(RB_IP) +
+      '&bundle=' + encodeURIComponent(name), {{ method: 'POST' }});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    out.textContent = 'run #' + d.run_id + ' (' + d.bundle + ') finished';
+    rbRuns();
+  }} catch (e) {{ out.textContent = 'run failed: ' + e.message; }}
+}}
+rbLoad();rbRuns();
 </script>");
 
     // dependency impact: what sits behind this device
@@ -862,7 +1001,18 @@ pub fn events_page(conn: &Connection, only_open: bool, severity: Option<&str>) -
             String::new()
         };
         let dev = e.ip.as_deref()
-            .map(|ip| format!("<a href=\"/device/{ip}\">{ip}</a>"))
+            .map(|ip| {
+                let link = format!("<a href=\"/device/{ip}\">{ip}</a>");
+                // FR-UX-005: any open critical/warning alarm leads to triage.
+                if e.state == "open" && matches!(e.severity.as_str(), "critical" | "warning") {
+                    format!(
+                        "{link} <a href=\"/triage?ip={}\" title=\"open one-click diagnosis\">triage</a>",
+                        urlencode(ip)
+                    )
+                } else {
+                    link
+                }
+            })
             .unwrap_or_default();
         let st = if e.state == "open" { badge("open") } else { closed_badge().to_string() };
         let _ = write!(body,
@@ -953,6 +1103,32 @@ pub fn settings_page(conn: &Connection, saved: bool) -> String {
         "</table><button type=\"submit\">save settings</button></form>\
 <h3>Outbound webhook test</h3>\
 <form class=\"inline\" method=\"post\" action=\"/api/webhook/test\"><button>send test payload</button></form>",
+    );
+    // Credential vault UI (FR-CFG-001): POST/DELETE /api/credentials had no
+    // console surface. Store follows the same form-post convention as the
+    // webhook test; delete uses fetch with inline feedback, no reload.
+    body.push_str(
+        "<h3>Credential vault</h3>\
+<p class=\"muted\">Secrets are encrypted at rest (XChaCha20, master key from NMS_VAULT_KEY / \
+NMS_VAULT_KEY_FILE) and never displayed again \u{2014} only the opaque reference you assign is kept.</p>\
+<form method=\"post\" action=\"/api/credentials\" style=\"display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px\">\
+<input name=\"credential_ref\" placeholder=\"ref (e.g. ssh-core1)\" size=\"26\" required>\
+<input type=\"password\" name=\"secret\" placeholder=\"secret\" autocomplete=\"new-password\" size=\"26\" required>\
+<button type=\"submit\">store credential</button></form>\
+<form class=\"inline\"><button type=\"button\" onclick=\"vaultDelete()\">delete ref\u{2026}</button></form>\
+<span id=\"vaultmsg\" class=\"muted\"></span>\
+<script>
+async function vaultDelete(){
+  const id = prompt('credential ref to delete:');
+  if (!id) return;
+  const m = document.getElementById('vaultmsg');
+  m.textContent = 'deleting ' + id + '…';
+  try {
+    const r = await fetch('/api/credentials/' + encodeURIComponent(id), { method: 'DELETE' });
+    m.textContent = r.ok ? 'deleted ' + id : 'delete failed (HTTP ' + r.status + ')';
+  } catch (e) { m.textContent = 'delete failed: ' + e.message; }
+}
+</script>",
     );
     page(conn, "Settings", "Settings", &body)
 }
@@ -1047,6 +1223,30 @@ fn urlencode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+/// Count stored config snapshots for one device under
+/// `<base>/configs/<ip>/<date>/<sha>.cfg.meta.json` (FR-CFG-002 layout).
+/// A missing directory simply counts zero; traversal-hostile ids count zero.
+fn snapshot_count(base: &std::path::Path, ip: &str) -> usize {
+    if ip.is_empty() || ip.starts_with('.') || ip.contains('/') || ip.contains('\\') {
+        return 0;
+    }
+    let Ok(days) = std::fs::read_dir(base.join("configs").join(ip)) else {
+        return 0;
+    };
+    let mut n = 0;
+    for day in days.flatten() {
+        let Ok(files) = std::fs::read_dir(day.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            if f.file_name().to_string_lossy().ends_with(".cfg.meta.json") {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 #[cfg(test)]
@@ -1288,5 +1488,128 @@ mod tests {
         let conn = dbh.lock();
         assert!(!reports_page_with_pdf(&conn, 24, None).contains("availability.pdf"));
         assert!(reports_page_with_pdf(&conn, 24, Some("2026-08-24")).contains("availability.pdf?date=2026-08-24"));
+    }
+
+    #[test]
+    fn dashboard_shows_intent_compliance_and_inspect_button() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        let now = chrono::Utc::now().timestamp();
+        for (kind, state) in [
+            ("intent:intent_violation/ntp", "open"),
+            ("intent:intent_violation/dns", "closed"),
+        ] {
+            conn.execute(
+                "INSERT INTO events(created_ts,updated_ts,device_id,ip,kind,severity,state,message) \
+                 VALUES (?1,?1,NULL,NULL,?2,'warning',?3,'viol')",
+                rusqlite::params![now, kind, state],
+            )
+            .unwrap();
+        }
+        let html = dashboard(&conn);
+        assert!(html.contains(">intent compliance<"));
+        // one of two distinct intents has an open violation
+        assert!(html.contains(">1/2</div>"));
+        assert!(html.contains("id=\"inspectbtn\""));
+        assert!(html.contains("/api/inspect"));
+    }
+
+    #[test]
+    fn dashboard_intent_card_zero_state_is_dim() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        let html = dashboard(&conn);
+        assert!(html.contains(">intent compliance<"));
+        assert!(html.contains("color:var(--dim)\">0/0<"));
+    }
+
+    #[test]
+    fn device_detail_shows_runbooks_panel() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        upsert(&conn, "10.9.4.1", "router");
+        let html = device_detail(&conn, "10.9.4.1");
+        assert!(html.contains("<h2>Runbooks</h2>"));
+        assert!(html.contains("/api/runbooks.json"));
+        assert!(html.contains("/api/runbook/runs.json?ip="));
+        assert!(html.contains("<h3>Recent runs</h3>"));
+        // endpoints can run bundles too
+        upsert(&conn, "10.9.4.2", "endpoint");
+        let html = device_detail(&conn, "10.9.4.2");
+        assert!(html.contains("<h2>Runbooks</h2>"));
+    }
+
+    #[test]
+    fn router_shows_config_backup_note_endpoint_does_not() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        upsert(&conn, "10.9.5.1", "router");
+        let html = device_detail(&conn, "10.9.5.1");
+        assert!(html.contains("Config backup: 0 snapshot(s)"));
+        upsert(&conn, "10.9.5.2", "endpoint");
+        let html = device_detail(&conn, "10.9.5.2");
+        assert!(!html.contains("Config backup:"));
+    }
+
+    #[test]
+    fn snapshot_count_counts_sidecars_and_tolerates_missing_dir() {
+        let out = tempfile::tempdir().unwrap();
+        assert_eq!(snapshot_count(out.path(), "192.0.2.50"), 0);
+        // traversal-hostile identifiers never touch the filesystem
+        assert_eq!(snapshot_count(out.path(), "../escape"), 0);
+        for (ts, content) in [(1_700_000_000i64, "host\n"), (1_700_086_400, "host v2\n")] {
+            engine::cfgmod::save_snapshot(
+                out.path(),
+                &engine::cfgmod::ConfigSnapshot {
+                    device_ip: "192.0.2.50".into(),
+                    collected_ts: ts,
+                    raw_sha256: String::new(),
+                    content: content.into(),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(snapshot_count(out.path(), "192.0.2.50"), 2);
+    }
+
+    #[test]
+    fn events_page_links_triage_for_open_critical_only() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        let now = chrono::Utc::now().timestamp();
+        db::create_event(&conn, None, Some("10.9.6.1"), "device_down", "critical", "down", None, now)
+            .unwrap();
+        db::create_event(&conn, None, Some("10.9.6.2"), "device_up", "info", "up", None, now).unwrap();
+        let html = events_page(&conn, false, None);
+        assert!(html.contains("/triage?ip=10.9.6.1"));
+        assert!(!html.contains("/triage?ip=10.9.6.2"));
+    }
+
+    #[test]
+    fn settings_page_exposes_credential_vault() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        let html = settings_page(&conn, false);
+        assert!(html.contains("Credential vault"));
+        assert!(html.contains("action=\"/api/credentials\""));
+        assert!(html.contains("vaultDelete"));
+        assert!(html.contains("DELETE"));
+    }
+
+    #[test]
+    fn devices_search_matches_hostname_and_site() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        upsert(&conn, "10.9.7.1", "router");
+        conn.execute("UPDATE devices SET hostname='edge-core' WHERE ip='10.9.7.1'", []).unwrap();
+        let site = db::ensure_site(&conn, "lab-west").unwrap();
+        conn.execute(
+            "UPDATE devices SET site_id=?1 WHERE ip='10.9.7.1'",
+            rusqlite::params![site],
+        )
+        .unwrap();
+        assert!(devices_page(&conn, "", "edge-cor").contains("10.9.7.1"));
+        assert!(devices_page(&conn, "", "lab-wes").contains("10.9.7.1"));
+        assert!(!devices_page(&conn, "", "zzz-not-there").contains("10.9.7.1</a>"));
     }
 }
