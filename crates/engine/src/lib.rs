@@ -12,6 +12,7 @@ pub mod diag;
 pub mod discover;
 pub mod engine;
 pub mod inspect;
+pub mod intents;
 pub mod jobs;
 pub mod logging;
 pub mod metrics;

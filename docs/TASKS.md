@@ -58,9 +58,14 @@ Statuses: OPEN | IN-PROGRESS | DONE (<commit>) | BLOCKED (<reason>)
   incident timeline; auto-run binding for critical alarms.
 - AC: bundled run on simulated down-device attaches trace+diag evidence rows.
 
-### T-007 · Intent checks v0 · agent: alarm-rca-builder · OPEN
+### T-007 · Intent checks v0 · agent: alarm-rca-builder · DONE (this commit)
 - FRs: INT-001/002. Scope: declarative assertions evaluated post-cycle;
   violations emit `intent_violation` events; compliance % per site.
+- Delivered: `engine::intents` registered and wired into `ops::process_result`
+  post-commit hook (`intents_enabled` setting, default on); dedupe key
+  (NULL-device, kind=`intent:intent_violation/<id>`); stale-clear fixed to the
+  composite kind prefix; `GET /api/intents.json` serves live compliance for
+  the dashboard intent card; sample at `output/intents/sample-wan-redundancy.yaml`.
 
 ### T-008 · Map time-travel scrubber · agent: console-builder · OPEN
 - FRs: TOP-003 partial. Scope: snapshot model.json history (hourly) +

@@ -452,6 +452,24 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
 
     tx.commit()?;
 
+    // ---- declarative intent checks (FR-INT-001/002, T-007): evaluate the
+    // YAML intents in <out_dir>/intents against committed state and open or
+    // clear `intent:intent_violation/<id>` alarms. Off via intents_enabled=0.
+    // Runs on the already-held `conn` guard — never re-lock the store mutex.
+    if db::get_setting_or(&conn, "intents_enabled", "1") == "1" {
+        let intents = crate::intents::load_intents(&out_dir.join("intents"));
+        if !intents.is_empty() {
+            let results = crate::intents::evaluate(&conn, &intents);
+            match crate::intents::sync_intent_events(&conn, &results, &intents, now) {
+                Ok((created, cleared)) if created > 0 || cleared > 0 => {
+                    println!("[ops] intents: {created} violation(s) opened, {cleared} cleared");
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[ops] intent evaluation failed: {e}"),
+            }
+        }
+    }
+
     // ---- auto-run runbook bundles on critical device_down alarms (FR-FLT-007)
     let autorun = db::get_setting_or(&conn, "runbooks_autorun", "1") == "1";
     if autorun {
@@ -795,6 +813,89 @@ mod tests {
         assert_eq!(rec.probes.len(), 2);
         assert_eq!(rec.probes[0].ip, Ipv4Addr::new(10, 0, 0, 1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_cycle_intent_hook_opens_dedupes_then_clears() {
+        // FR-INT-001/002 wiring: violations surface within one evaluation
+        // cycle exactly once (dedupe) and flip to cleared on recovery.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("intents")).unwrap();
+        std::fs::write(
+            dir.path().join("intents/wan.yaml"),
+            "id: branch-wan-redundancy\ndescription: 2+ up routers per site\n\
+             rule:\n  type: min_role_up\n  role: router\n  count: 2\n",
+        ).unwrap();
+
+        let dev = |ip: Ipv4Addr, state: State| crate::model::Device {
+            ip,
+            mac: None,
+            role: Role::Router,
+            state,
+            subnet: Some("10.9.0.0/24".into()),
+            rtt_ms: if state == State::Up { Some(1.0) } else { None },
+            reply_ttl: None,
+            hint: None,
+            first_seen: chrono::Utc::now().to_rfc3339(),
+            last_seen: chrono::Utc::now().to_rfc3339(),
+            down_since: None,
+            ever_up: true,
+            wap: None,
+            wap_source: None,
+            hostname: None,
+            device_class: None,
+        };
+        let run = |r2_up: bool| -> check::RunResult {
+            let r1 = Ipv4Addr::new(10, 9, 0, 1);
+            let r2 = Ipv4Addr::new(10, 9, 0, 2);
+            let model = Model {
+                generated_at: chrono::Utc::now().to_rfc3339(),
+                scan_duration_ms: 0,
+                backend: "synthetic".into(),
+                subnets: vec![Subnet {
+                    cidr: "10.9.0.0/24".into(), origin: "test".into(),
+                    sampled: false, hosts: 2, probed: 2, alive: u64::from(r2_up) + 1,
+                }],
+                devices: vec![
+                    dev(r1, State::Up),
+                    dev(r2, if r2_up { State::Up } else { State::Down }),
+                ],
+                edges: Vec::new(),
+            };
+            model.save(&dir.path().join("model.json")).unwrap();
+            check::RunResult {
+                model,
+                transitions: Vec::new(),
+                probes: vec![
+                    Probe { ip: r1, up: true, rtt_ms: Some(1.0) },
+                    Probe { ip: r2, up: r2_up, rtt_ms: r2_up.then_some(1.5) },
+                ],
+                unprobed: 0,
+            }
+        };
+        let kind = "intent:intent_violation/branch-wan-redundancy";
+        let db = Arc::new(Db::open_memory().unwrap());
+
+        process_result(&db, &run(false), dir.path()).unwrap();
+        process_result(&db, &run(false), dir.path()).unwrap();
+        {
+            let conn = db.lock();
+            let (open, total): (i64, i64) = conn.query_row(
+                "SELECT SUM(state='open'), COUNT(*) FROM events WHERE kind=?1",
+                [kind], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?)),
+            ).unwrap();
+            assert_eq!((open, total), (1, 1), "one alarm, no duplicates across cycles");
+        }
+
+        process_result(&db, &run(true), dir.path()).unwrap();
+        {
+            let conn = db.lock();
+            let (open, cleared): (i64, i64) = conn.query_row(
+                "SELECT SUM(state='open'), SUM(state='cleared') FROM events WHERE kind=?1",
+                [kind], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?)),
+            ).unwrap();
+            assert_eq!((open, cleared), (0, 1), "recovery transitions open->cleared");
+        }
     }
 
     #[test]

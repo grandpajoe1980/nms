@@ -507,6 +507,30 @@ fn route_as(method: &str, path: &str, query: &str, body: &str, cookie: Option<&s
                 Err(e) => json("500 Internal Server Error", serde_json::json!({"error": e.to_string()})),
             }
         }
+        ("GET", "/api/intents.json") => {
+            let conn = shared.store.lock();
+            let (intents, results) =
+                engine::intents::load_and_evaluate(&conn, &p.out_dir.join("intents"));
+            let list: Vec<serde_json::Value> = intents.iter().map(|i| {
+                let r = results.iter().find(|r| r.intent_id == i.id);
+                serde_json::json!({
+                    "id": i.id,
+                    "description": i.description,
+                    "severity": i.severity,
+                    "sites": i.sites,
+                    "compliant": r.map(|r| r.compliant).unwrap_or(true),
+                    "violations": r.map(|r| r.violations.iter().map(|v| serde_json::json!({
+                        "site": v.site, "detail": v.detail,
+                    })).collect::<Vec<_>>()).unwrap_or_default(),
+                })
+            }).collect();
+            json("200 OK", serde_json::json!({
+                "enabled": engine::db::get_setting_or(&conn, "intents_enabled", "1") == "1",
+                "count": intents.len(),
+                "violations": list.iter().filter(|i| i["compliant"] == false).count(),
+                "intents": list,
+            }))
+        }
         ("GET", "/api/health") => health_endpoint(shared),
         ("GET", "/api/openapi.json") => json("200 OK", openapi_spec()),
         ("GET", "/metrics") => text(
@@ -1073,6 +1097,7 @@ pub const API_ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/api/search", "Global search across devices and sites"),
     ("GET", "/api/model", "Current discovered topology model.json"),
     ("GET", "/api/dashboard.json", "Dashboard aggregates: counts, trend, worst latency, event counters"),
+    ("GET", "/api/intents.json", "Loaded intent checks (FR-INT-001/002) with live compliance status per intent"),
     ("GET", "/api/device/{ip}.json", "One inventory device record"),
     ("GET", "/api/report/availability.csv", "Per-site availability CSV for a time window"),
     ("GET", "/api/report/devices.csv", "Per-device availability CSV for a window/site"),
@@ -1621,6 +1646,52 @@ mod tests {
             );
             assert!(!summary.is_empty());
         }
+    }
+
+    #[test]
+    fn intents_endpoint_reports_live_compliance() {
+        let shared = test_shared();
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = test_params();
+        p.out_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(dir.path().join("intents")).unwrap();
+        std::fs::write(
+            dir.path().join("intents/wan.yaml"),
+            "id: branch-wan-redundancy\ndescription: Branch sites need 2+ up routers\n\
+             severity: critical\nrule:\n  type: min_role_up\n  role: router\n  count: 2\n",
+        ).unwrap();
+        {
+            let conn = shared.store.lock();
+            conn.execute(
+                "INSERT INTO sites(name, created_ts) VALUES ('branch-1', 1000)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO devices(ip, role, site_id, managed, first_seen_ts, last_seen_ts,
+                     state, eff_state)
+                 VALUES ('10.9.0.1', 'router', 1, 1, 1000, 1000, 'up', 'up')",
+                [],
+            ).unwrap();
+            // Open violation exactly as the post-cycle ops hook records it.
+            conn.execute(
+                "INSERT INTO events(created_ts, device_id, ip, kind, severity, state, message)
+                 VALUES (2000, NULL, NULL,
+                     'intent:intent_violation/branch-wan-redundancy', 'critical', 'open', 'v')",
+                [],
+            ).unwrap();
+        }
+        let resp =
+            String::from_utf8(route("GET", "/api/intents.json", "", "", None, &shared, &p)).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp[resp.find('{').unwrap()..].trim()).unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["violations"], 1);
+        assert_eq!(v["intents"][0]["id"], "branch-wan-redundancy");
+        assert_eq!(v["intents"][0]["compliant"], false);
+        assert_eq!(v["intents"][0]["violations"][0]["site"], "branch-1");
+        assert_eq!(v["intents"][0]["violations"][0]["detail"], "1");
     }
 
     #[test]
