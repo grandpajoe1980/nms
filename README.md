@@ -91,6 +91,10 @@ list endpoint. In open mode, bootstrap an admin bearer token with
 `nms token add vault-admin --role admin` and send it as `Authorization: Bearer
 ...` for these mutations. No configuration push is implemented.
 
+On Windows, the standard library cannot reliably validate NTFS DACLs for
+`NMS_VAULT_KEY_FILE`; protect that file with an administrator-only ACL. Prefer
+`NMS_VAULT_KEY` from a protected process environment when practical.
+
 ## The web console (`nms serve`)
 
 `http://127.0.0.1:8765` — the map page keeps its original controls (Discover,

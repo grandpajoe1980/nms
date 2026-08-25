@@ -97,23 +97,56 @@ fn record_login_failure(shared: &Shared, username: &str, now: i64) {
     map.insert(username.to_string(), entry);
 }
 
-/// Resolve the authenticated role for a request, if any.
+/// Resolve the authenticated principal for a request, if any.
 /// Bearer tokens (automation) and session cookies both hash to stored values.
-fn resolve_role(shared: &Shared, authorization: Option<&str>, cookie: Option<&str>) -> Option<String> {
+fn resolve_principal(shared: &Shared, authorization: Option<&str>, cookie: Option<&str>) -> Option<db::PrincipalRec> {
     let conn = shared.store.lock();
     if let Some(header) = authorization {
         let raw = header.strip_prefix("Bearer ").map(str::trim).filter(|s| !s.is_empty());
         if let Some(raw) = raw {
             let hashed = engine::auth::token_hash(raw);
-            if let Ok(Some(role)) = db::api_token_role(&conn, &hashed) {
-                return Some(role);
+            if let Ok(Some(principal)) = db::api_token_principal(&conn, &hashed) {
+                return Some(principal);
             }
         }
     }
     let raw = cookie
         .and_then(|c| c.split(';').find_map(|part| part.trim().strip_prefix("nms_session=")))
         .filter(|s| !s.is_empty())?;
-    db::session_role(&conn, &engine::auth::token_hash(raw)).ok().flatten()
+    db::session_principal(&conn, &engine::auth::token_hash(raw)).ok().flatten()
+}
+
+/// Apply the complete request authorization policy and return the authenticated
+/// principal for audit attribution. A vault mutation is gated even in open
+/// mode; other routes retain the historical open-mode behavior.
+fn authorization_gate(
+    shared: &Shared,
+    method: &str,
+    path: &str,
+    authorization: Option<&str>,
+    cookie: Option<&str>,
+) -> Result<Option<db::PrincipalRec>, Vec<u8>> {
+    let vault_mutation = (method == "POST" && path == "/api/credentials")
+        || (method == "DELETE" && path.starts_with("/api/credentials/"));
+    if !shared.hardened && !vault_mutation {
+        return Ok(None);
+    }
+    let Some((rank, is_api)) = engine::auth::requirement(method, path) else {
+        return Ok(None);
+    };
+    let principal = resolve_principal(shared, authorization, cookie);
+    match principal {
+        None => Err(unauthorized(is_api)),
+        Some(principal) => {
+            let role = engine::auth::Role::parse(&principal.role)
+                .unwrap_or(engine::auth::Role::Viewer);
+            if engine::auth::authorized(role, is_api, rank) {
+                Ok(Some(principal))
+            } else {
+                Err(forbidden(is_api))
+            }
+        }
+    }
 }
 
 fn login_page(err: Option<&str>) -> Vec<u8> {
@@ -318,33 +351,18 @@ fn handle(stream: TcpStream, shared: Arc<Shared>, p: Params) {
     let target = parts.next().unwrap_or("/");
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
-    // Hardened-mode enforcement gate (FR-PLAT-005).
-    let vault_mutation = (method == "POST" && path == "/api/credentials")
-        || (method == "DELETE" && path.starts_with("/api/credentials/"));
-    if shared.hardened || vault_mutation {
-        if let Some((rank, is_api)) = engine::auth::requirement(method, path) {
-            match resolve_role(&shared, authorization.as_deref(), cookie.as_deref()) {
-                None => {
-                    let _ = writer.write_all(&unauthorized(is_api));
-                    let _ = writer.flush();
-                    return;
-                }
-                Some(role_str) => {
-                    let role = engine::auth::Role::parse(&role_str)
-                        .unwrap_or(engine::auth::Role::Viewer);
-                    if !engine::auth::authorized(role, is_api, rank) {
-                        let _ = writer.write_all(&forbidden(is_api));
-                        let _ = writer.flush();
-                        return;
-                    }
-                }
-            }
+    let principal = match authorization_gate(&shared, method, path, authorization.as_deref(), cookie.as_deref()) {
+        Ok(principal) => principal,
+        Err(response) => {
+            let _ = writer.write_all(&response);
+            let _ = writer.flush();
+            return;
         }
-    }
+    };
 
     let response = {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            route(method, path, query, &body, cookie.as_deref(), &shared, &p)
+            route_as(method, path, query, &body, cookie.as_deref(), principal.as_ref().map(|p| p.actor.as_str()), &shared, &p)
         }));
         match result {
             Ok(resp) => resp,
@@ -396,7 +414,13 @@ fn html(status: &str, page: String) -> Vec<u8> {
     response(status, "text/html; charset=utf-8", page.into_bytes())
 }
 
+#[cfg(test)]
 fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
+    route_as(method, path, query, body, cookie, None, shared, p)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_as(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>, actor: Option<&str>, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => map_page(shared, p),
         ("GET", "/map") => map_page(shared, p),
@@ -457,9 +481,9 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
         }
         ("GET", "/api/report/availability.pdf") => availability_pdf_endpoint(query, p),
         ("POST", "/api/settings") => settings_save(body, shared),
-        ("POST", "/api/credentials") => credential_write(body, shared, p),
+        ("POST", "/api/credentials") => credential_write(body, actor.unwrap_or("web:admin"), shared, p),
         _ if method == "DELETE" && path.starts_with("/api/credentials/") => {
-            credential_delete(path.trim_start_matches("/api/credentials/"), shared, p)
+            credential_delete(path.trim_start_matches("/api/credentials/"), actor.unwrap_or("web:admin"), shared, p)
         }
         ("POST", "/api/device") => device_action(body, shared, p),
         ("POST", "/api/event/ack") => event_ack(body, shared),
@@ -547,7 +571,7 @@ fn response(status: &str, content_type: &str, body: Vec<u8>) -> Vec<u8> {
     out
 }
 
-fn credential_write(body: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
+fn credential_write(body: &str, actor: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
     let (id, secret): (String, Zeroizing<Vec<u8>>) = if body.trim_start().starts_with('{') {
         let value: serde_json::Value = match serde_json::from_str(body) {
             Ok(v) => v,
@@ -568,18 +592,18 @@ fn credential_write(body: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
     }
     match engine::vault::write_secret(&p.out_dir, &id, &secret) {
         Ok(()) => {
-            db::audit(&shared.store.lock(), "web:admin", "credential.create", &id, "encrypted credential stored");
+            db::audit(&shared.store.lock(), actor, "credential.create", &id, "encrypted credential stored");
             json("201 Created", serde_json::json!({"credential_ref": id, "status":"stored"}))
         }
         Err(e) => json("400 Bad Request", serde_json::json!({"error": e.to_string()})),
     }
 }
 
-fn credential_delete(encoded_id: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
+fn credential_delete(encoded_id: &str, actor: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
     let id = url_decode(encoded_id);
     match engine::vault::delete_secret(&p.out_dir, &id) {
         Ok(()) => {
-            db::audit(&shared.store.lock(), "web:admin", "credential.delete", &id, "encrypted credential deleted");
+            db::audit(&shared.store.lock(), actor, "credential.delete", &id, "encrypted credential deleted");
             json("200 OK", serde_json::json!({"credential_ref": id, "status":"deleted"}))
         }
         Err(e) => json("404 Not Found", serde_json::json!({"error": e.to_string()})),
@@ -1541,13 +1565,13 @@ mod tests {
         std::env::set_var("NMS_VAULT_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
         let shared = test_shared();
         let body = r#"{"credential_ref":"router-r1","secret":"PRIVATE KEY MATERIAL"}"#;
-        let write = String::from_utf8(route("POST", "/api/credentials", "", body, None, &shared, &p)).unwrap();
+        let write = String::from_utf8(route_as("POST", "/api/credentials", "", body, None, Some("token:admin-vault"), &shared, &p)).unwrap();
         assert!(write.starts_with("HTTP/1.1 201 Created"));
         assert!(write.contains("router-r1"));
         assert!(!write.contains("PRIVATE KEY MATERIAL"));
         let record = std::fs::read(dir.path().join("credentials/router-r1.json")).unwrap();
         assert!(!String::from_utf8_lossy(&record).contains("PRIVATE KEY MATERIAL"));
-        let deleted = String::from_utf8(route("DELETE", "/api/credentials/router-r1", "", "", None, &shared, &p)).unwrap();
+        let deleted = String::from_utf8(route_as("DELETE", "/api/credentials/router-r1", "", "", None, Some("token:admin-vault"), &shared, &p)).unwrap();
         assert!(deleted.starts_with("HTTP/1.1 200 OK"));
         assert!(!dir.path().join("credentials/router-r1.json").exists());
         let conn = shared.store.lock();
@@ -1557,6 +1581,12 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(audit_count, 2);
+        let actor: String = conn.query_row(
+            "SELECT actor FROM audit_log WHERE action='credential.create' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(actor, "token:admin-vault");
         std::env::remove_var("NMS_VAULT_KEY");
     }
 
@@ -1566,6 +1596,35 @@ mod tests {
         assert_eq!(engine::auth::requirement("DELETE", "/api/credentials/router-r1"), Some((2, true)));
         assert!(!engine::auth::authorized(engine::auth::Role::Operator, true, 2));
         assert!(engine::auth::authorized(engine::auth::Role::Admin, true, 2));
+    }
+
+    #[test]
+    fn credential_gate_rejects_anonymous_and_operator_but_allows_admin() {
+        let shared = test_shared();
+        let dir = tempfile::tempdir().unwrap();
+        let mut params = test_params();
+        params.out_dir = dir.path().to_path_buf();
+        std::env::set_var("NMS_VAULT_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        let add = |name: &str, role: &str| {
+            let (raw, hashed) = engine::auth::new_token();
+            db::add_api_token(&shared.store.lock(), &hashed, name, role).unwrap();
+            (raw, hashed)
+        };
+        let (operator, _) = add("ops", "operator");
+        let (admin, _) = add("vault-admin", "admin");
+        let denied = authorization_gate(&shared, "POST", "/api/credentials", None, None).unwrap_err();
+        assert!(String::from_utf8(denied).unwrap().starts_with("HTTP/1.1 401"));
+        assert!(!dir.path().join("credentials/denied.json").exists());
+        let denied = authorization_gate(&shared, "POST", "/api/credentials", Some(&format!("Bearer {operator}")), None).unwrap_err();
+        assert!(String::from_utf8(denied).unwrap().starts_with("HTTP/1.1 403"));
+        assert!(!dir.path().join("credentials/denied.json").exists());
+        let principal = authorization_gate(&shared, "POST", "/api/credentials", Some(&format!("Bearer {admin}")), None).unwrap().unwrap();
+        assert_eq!(principal.actor, "token:vault-admin");
+        engine::vault::write_secret(dir.path(), "r1", b"secret").unwrap();
+        assert!(authorization_gate(&shared, "DELETE", "/api/credentials/r1", Some(&format!("Bearer {operator}")), None).is_err());
+        assert!(dir.path().join("credentials/r1.json").exists());
+        assert!(authorization_gate(&shared, "DELETE", "/api/credentials/r1", Some(&format!("Bearer {admin}")), None).is_ok());
+        std::env::remove_var("NMS_VAULT_KEY");
     }
 
     #[test]

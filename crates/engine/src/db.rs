@@ -1163,6 +1163,14 @@ pub struct UserRec {
     pub disabled: bool,
 }
 
+/// Authenticated principal identity for audit attribution. Never contains a
+/// raw token or token hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrincipalRec {
+    pub actor: String,
+    pub role: String,
+}
+
 pub fn create_user(conn: &Connection, username: &str, password_hash: &str, role: &str) -> Result<i64> {
     conn.execute(
         "INSERT INTO users(username, password_hash, role, created_ts) VALUES (?1, ?2, ?3, ?4)",
@@ -1236,6 +1244,21 @@ pub fn session_role(conn: &Connection, token_hash: &str) -> Result<Option<String
     }
 }
 
+pub fn session_principal(conn: &Connection, token_hash: &str) -> Result<Option<PrincipalRec>> {
+    let res: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT u.username, u.role, s.expires_ts FROM sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ?1 AND u.disabled = 0",
+            params![token_hash],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(res.and_then(|(username, role, expires)| (expires > now()).then_some(PrincipalRec {
+        actor: format!("user:{username}"),
+        role,
+    })))
+}
+
 pub fn delete_session(conn: &Connection, token_hash: &str) -> Result<()> {
     conn.execute("DELETE FROM sessions WHERE token_hash = ?1", params![token_hash])?;
     Ok(())
@@ -1263,6 +1286,19 @@ pub fn api_token_role(conn: &Connection, token_hash: &str) -> Result<Option<Stri
         )
         .optional()?;
     Ok(res)
+}
+
+pub fn api_token_principal(conn: &Connection, token_hash: &str) -> Result<Option<PrincipalRec>> {
+    conn.query_row(
+        "SELECT name, role FROM api_tokens WHERE token_hash = ?1 AND disabled = 0",
+        params![token_hash],
+        |r| Ok(PrincipalRec {
+            actor: format!("token:{}", r.get::<_, String>(0)?),
+            role: r.get(1)?,
+        }),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 // ------------------------------------------------------------------- diag
