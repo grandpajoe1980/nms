@@ -76,14 +76,14 @@ fn throttle_decision(count: u32, last_ts: i64, now: i64) -> bool {
 }
 
 fn login_throttled(shared: &Shared, username: &str, now: i64) -> bool {
-    match shared.login_failures.lock().unwrap().get(username) {
+    match shared.login_failures.lock().unwrap_or_else(|e| e.into_inner()).get(username) {
         Some(&(count, last_ts)) => throttle_decision(count, last_ts, now),
         None => false,
     }
 }
 
 fn record_login_failure(shared: &Shared, username: &str, now: i64) {
-    let mut map = shared.login_failures.lock().unwrap();
+    let mut map = shared.login_failures.lock().unwrap_or_else(|e| e.into_inner());
     let entry = match map.get(username) {
         Some(&(count, last_ts)) if now.saturating_sub(last_ts) < LOGIN_WINDOW_SECS => {
             (count + 1, now)
@@ -176,7 +176,7 @@ fn login_submit(body: &str, shared: &Arc<Shared>) -> Vec<u8> {
         .filter(|u| !u.disabled);
     match user {
         Some(u) if engine::auth::verify_password(&password, &u.password_hash) => {
-            shared.login_failures.lock().unwrap().remove(&username);
+            shared.login_failures.lock().unwrap_or_else(|e| e.into_inner()).remove(&username);
             let (raw, hashed) = engine::auth::new_token();
             let expires = chrono::Utc::now().timestamp() + 7 * 86_400;
             let _ = db::create_session(&shared.store.lock(), &hashed, u.id, &u.role, expires);
@@ -237,6 +237,8 @@ pub fn run(p: Params) -> Result<()> {
         store,
     });
     let url = format!("http://{addr}");
+    engine::logging::init(p.out_dir.join("nms.log"));
+    engine::logging::info(&format!("server starting: {url} hardened={hardened}"));
     println!("[*] NMS control panel: {url}");
     let pending = engine::ops::spool_count(&p.out_dir);
     if pending > 0 {
@@ -337,7 +339,22 @@ fn handle(stream: TcpStream, shared: Arc<Shared>, p: Params) {
         }
     }
 
-    let response = route(method, path, query, &body, cookie.as_deref(), &shared, &p);
+    let response = {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            route(method, path, query, &body, cookie.as_deref(), &shared, &p)
+        }));
+        match result {
+            Ok(resp) => resp,
+            Err(_) => {
+                engine::logging::error(&format!("handler panicked: {} {}", method, path));
+                text("500 Internal Server Error", "internal error".into())
+            }
+        }
+    };
+    if path.starts_with("/api/") {
+        let status = String::from_utf8_lossy(&response[..response.len().min(24)]).to_string();
+        engine::logging::info(&format!("{} {} -> {}", method, path, status.split_whitespace().nth(1).unwrap_or("?")));
+    }
     let _ = writer.write_all(&response);
     let _ = writer.flush();
 }
@@ -469,17 +486,17 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
             Err(_) => json("404 Not Found", serde_json::json!({"error":"no model yet"})),
         },
         ("GET", "/api/status") => {
-            let job = *shared.job.lock().unwrap();
-            let stats = shared.last_stats.lock().unwrap().clone();
+            let job = *shared.job.lock().unwrap_or_else(|e| e.into_inner());
+            let stats = shared.last_stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
             json(
                 "200 OK",
                 serde_json::json!({
                     "job": job.as_str(),
                     "monitoring": shared.monitoring.load(Ordering::Relaxed),
-                    "message": shared.message.lock().unwrap().clone(),
+                    "message": shared.message.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                     "revision": shared.revision.load(Ordering::Relaxed),
                     "progress": engine::progress::snapshot(),
-                    "events": shared.events.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
+                    "events": shared.events.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect::<Vec<_>>(),
                     "ops": stats,
                 }),
             )
@@ -869,7 +886,7 @@ fn health_endpoint(shared: &Arc<Shared>) -> Vec<u8> {
     let db_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let (job, monitoring) = (
-        *shared.job.lock().unwrap(),
+        *shared.job.lock().unwrap_or_else(|e| e.into_inner()),
         shared.monitoring.load(Ordering::Relaxed),
     );
     let scheduler_state = match (job, monitoring) {
@@ -902,7 +919,7 @@ fn health_endpoint(shared: &Arc<Shared>) -> Vec<u8> {
                 },
                 "scheduler": {
                     "status": scheduler_state,
-                    "last_cycle": shared.last_stats.lock().unwrap().clone(),
+                    "last_cycle": shared.last_stats.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 },
                 "webhook_queue": {
                     "pending": pending_outbound,
@@ -1018,12 +1035,12 @@ fn json(status: &str, value: serde_json::Value) -> Vec<u8> {
 }
 
 fn set_message(shared: &Arc<Shared>, message: &str) {
-    *shared.message.lock().unwrap() = message.to_string();
+    *shared.message.lock().unwrap_or_else(|e| e.into_inner()) = message.to_string();
 }
 
 fn start_job(shared: &Arc<Shared>, p: &Params, kind: Job) -> Vec<u8> {
     {
-        let mut current = shared.job.lock().unwrap();
+        let mut current = shared.job.lock().unwrap_or_else(|e| e.into_inner());
         if *current != Job::Idle {
             return text("409 Conflict", format!("{} already running", current.as_str()));
         }
@@ -1047,6 +1064,7 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     set_message(&shared, &format!("{} running", kind.as_str()));
+    engine::logging::info(&format!("job start: {}", kind.as_str()));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
         Job::Inspect => {
             let community = db::get_setting_or(&shared.store.lock(), "snmp_community", "public");
@@ -1094,7 +1112,7 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
                 for transition in &result.transitions {
                     push_transition(&shared, transition);
                 }
-                *shared.last_stats.lock().unwrap() = Some(stats.clone());
+                *shared.last_stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());
                 Ok(format!(
                     "check complete: up={up} down_root={down} unreachable={unreach} \
                          degraded={deg} events=+{ev} queued={q}",
@@ -1168,7 +1186,7 @@ fn monitor_loop(shared: Arc<Shared>, p: Params) {
         };
         let started = std::time::Instant::now();
         {
-            let _engine = shared.engine_lock.lock().unwrap();
+            let _engine = shared.engine_lock.lock().unwrap_or_else(|e| e.into_inner());
             if !shared.monitoring.load(Ordering::Relaxed) {
                 break;
             }
@@ -1177,7 +1195,7 @@ fn monitor_loop(shared: Arc<Shared>, p: Params) {
                     for transition in &result.transitions {
                         push_transition(&shared, transition);
                     }
-                    *shared.last_stats.lock().unwrap() = Some(stats.clone());
+                    *shared.last_stats.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());
                     shared.revision.fetch_add(1, Ordering::Relaxed);
                     let message = format!(
                         "monitor: up={up} down_root={down} unreachable={unreach} \
@@ -1322,7 +1340,7 @@ fn push_transition(shared: &Arc<Shared>, transition: &Transition) {
 }
 
 fn push_event(shared: &Arc<Shared>, event: Event) {
-    let mut events = shared.events.lock().unwrap();
+    let mut events = shared.events.lock().unwrap_or_else(|e| e.into_inner());
     events.push_front(event);
     while events.len() > 30 {
         events.pop_back();

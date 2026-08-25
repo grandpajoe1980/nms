@@ -18,6 +18,7 @@ pub fn run(p: Params) -> Result<()> {
         p.check.out_dir.display()
     );
     println!("[*] alerts fire on up->down transitions; Ctrl+C to stop");
+    crate::logging::init(p.check.out_dir.join("nms.log"));
     let store = std::sync::Arc::new(crate::db::Db::open(&p.check.out_dir.join("ops.db"))?);
     let pending = crate::ops::spool_count(&p.check.out_dir);
     if pending > 0 {
