@@ -191,7 +191,7 @@ fn site_power_blip_yields_one_root_critical_per_episode_and_zero_endpoint_storm(
 }
 
 #[test]
-fn flap_damping_raises_one_warning_then_stays_quiet() {
+fn flap_damping_tracks_churn_without_noncanonical_events() {
     let (dbh, model, dir) = setup();
     let target = "10.20.30.50";
 
@@ -205,31 +205,39 @@ fn flap_damping_raises_one_warning_then_stays_quiet() {
         ops::process_result(&dbh, &run_for(&model, ips), dir.path()).unwrap();
     }
 
-    let flap_warnings: i64 = dbh
+    let noncanonical: i64 = dbh
         .lock()
         .query_row(
-            "SELECT COUNT(*) FROM events WHERE kind='flapping' AND severity='warning' AND device_id =
+            "SELECT COUNT(*) FROM events WHERE kind IN ('site_outage', 'perf_latency', 'perf_loss', 'flapping') AND device_id =
                  (SELECT id FROM devices WHERE ip=?1)",
             [target],
             |r| r.get(0),
         )
         .unwrap();
-    assert!(
-        (1..=2).contains(&flap_warnings),
-        "flapping must be flagged once (damped), got {flap_warnings}"
-    );
+    assert_eq!(noncanonical, 0, "noncanonical event kinds must never be emitted");
 
-    // Stability clears it: several quiet cycles later the flap event closes
+    let flap_count: i64 = dbh
+        .lock()
+        .query_row("SELECT flap_count FROM devices WHERE ip=?1", [target], |r| r.get(0))
+        .unwrap();
+    assert!(flap_count >= 5, "flap damping must still track transition count");
+    let alert_lines = std::fs::read_to_string(dir.path().join("alerts.log"))
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(alert_lines, 4, "flap damping must suppress repeated down pages");
+
+    // Stability clears the damping state after several quiet cycles.
     for _ in 0..8 {
         ops::process_result(&dbh, &run_for(&model, &[]), dir.path()).unwrap();
     }
-    let open_flaps: i64 = dbh
+    let stable_cycles: i64 = dbh
         .lock()
         .query_row(
-            "SELECT COUNT(*) FROM events WHERE kind='flapping' AND state='open'",
-            [],
+            "SELECT stable_cycles FROM devices WHERE ip=?1",
+            [target],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(open_flaps, 0, "stable device must clear its flapping flag");
+    assert!(stable_cycles >= 5, "stable device must leave damping state");
 }

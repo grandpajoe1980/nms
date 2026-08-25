@@ -68,6 +68,7 @@ Statuses: OPEN | IN-PROGRESS | DONE (<commit>) | BLOCKED (<reason>)
 ---
 
 ## Done (recent)
+- ✅ Canonical event taxonomy + frozen webhook v1 shape (FR-EVT-001, FR-FLT-009)
 - ✅ Interface inventory via ifTable walks (FR-DISC-003)
 - ✅ LLDP/CDP neighbor collection + UI (FR-DISC-004)
 - ✅ ServiceNow direct mode + transform layer (FR-INTG-001a code-complete)

@@ -1,7 +1,7 @@
 // Temporary until all consumers land (removed during integration).
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashMap;
 use std::path::Path;
@@ -93,6 +93,55 @@ pub struct EventRec {
     pub ack_by: Option<String>,
     pub ack_ts: Option<i64>,
     pub cleared_ts: Option<i64>,
+}
+
+/// Return whether an event kind belongs to the frozen PRD §10 taxonomy.
+///
+/// This is deliberately strict: event producers must not silently add a
+/// second, incompatible vocabulary to the append-only event log.
+pub fn is_canonical_event_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "device_down"
+            | "device_up"
+            | "unreachable_set"
+            | "unreachable_cleared"
+            | "latency_warn"
+            | "latency_crit"
+            | "loss_warn"
+            | "jitter_warn"
+            | "http_check_failed"
+            | "neighbor_added"
+            | "neighbor_removed"
+            | "path_changed"
+            | "site_isolated"
+            | "redundancy_lost"
+            | "config_changed"
+            | "config_diff_failed"
+            | "compliance_violation"
+            | "golden_drift"
+            | "device_added"
+            | "device_removed"
+            | "device_retired"
+            | "role_changed"
+            | "os_changed"
+            | "collector_offline"
+            | "poll_backlog"
+            | "storage_pressure"
+            | "webhook_delivery_failed"
+            | "auth_failure"
+            | "anomaly_score_high"
+            | "forecast_breach"
+            | "intent_violation"
+    ) || (kind.starts_with("service_down(")
+        && kind.ends_with(')')
+        && kind.len() > "service_down()".len())
+        || (kind.starts_with("utilization_warn(")
+            && kind.ends_with(')')
+            && kind.len() > "utilization_warn()".len())
+        || (kind.starts_with("utilization_crit(")
+            && kind.ends_with(')')
+            && kind.len() > "utilization_crit()".len())
 }
 
 fn now() -> i64 {
@@ -830,6 +879,9 @@ pub fn create_event(
     details: Option<&str>,
     ts: i64,
 ) -> Result<EventRec> {
+    if !is_canonical_event_kind(kind) {
+        bail!("non-canonical event kind: {kind}");
+    }
     conn.execute(
         "INSERT INTO events(created_ts, device_id, ip, kind, severity, state, message, details)
          VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
@@ -1337,7 +1389,7 @@ mod tests {
         let e1 = create_event(&c, Some(1), Some("10.0.0.5"), "device_down", "critical",
                               "router down", None, 1_000).unwrap();
         ack_event(&c, e1.id, true, "web", 1_060).unwrap();
-        let e2 = create_event(&c, Some(2), Some("10.0.0.6"), "high_latency", "warning",
+        let e2 = create_event(&c, Some(2), Some("10.0.0.6"), "latency_warn", "warning",
                               "latency spike", None, 2_000).unwrap();
         ack_event(&c, e2.id, true, "web", 2_140).unwrap();
         let unacked = create_event(&c, Some(3), Some("10.0.0.7"), "device_down", "critical",
@@ -1653,5 +1705,37 @@ mod neighbor_tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].protocol, "lldp");
         assert_eq!(got[0].neighbor_sysname.as_deref(), Some("core-sw"));
+    }
+}
+
+#[cfg(test)]
+mod canonical_event_tests {
+    use super::*;
+
+    #[test]
+    fn taxonomy_rejects_legacy_kinds_and_accepts_canonical_forms() {
+        for legacy in ["site_outage", "perf_latency", "perf_loss", "flapping", "high_latency"] {
+            assert!(!is_canonical_event_kind(legacy), "legacy kind {legacy} must be rejected");
+        }
+        for canonical in [
+            "device_down",
+            "latency_warn",
+            "latency_crit",
+            "loss_warn",
+            "http_check_failed",
+            "service_down(443)",
+            "utilization_warn(80%)",
+        ] {
+            assert!(is_canonical_event_kind(canonical), "canonical kind {canonical} must be accepted");
+        }
+        assert!(!is_canonical_event_kind("http_check_failed(500)"));
+        assert!(!is_canonical_event_kind("service_down()"));
+        assert!(!is_canonical_event_kind("utilization_warn()"));
+
+        let db = Db::open_memory().unwrap();
+        let c = db.lock();
+        let err = create_event(&c, None, None, "flapping", "warning", "unstable", None, 1)
+            .expect_err("legacy event kind must not enter the append-only log");
+        assert!(err.to_string().contains("non-canonical event kind"));
     }
 }

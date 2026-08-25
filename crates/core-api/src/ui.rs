@@ -1226,7 +1226,7 @@ mod tests {
             &conn,
             Some(1),
             Some("10.9.0.7"),
-            "high_latency",
+            "latency_warn",
             "warning",
             "latency spike",
             None,

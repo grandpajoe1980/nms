@@ -220,17 +220,17 @@ fn classify_perf(
     };
     let ev = match status {
         "latency_crit" => Some((
-            "perf_latency",
+            "latency_crit",
             "critical",
             format!("average latency {avg_rtt:.0} ms exceeds critical threshold {crit_ms:.0} ms"),
         )),
         "latency_warn" => Some((
-            "perf_latency",
+            "latency_warn",
             "warning",
             format!("average latency {avg_rtt:.0} ms exceeds warning threshold {warn_ms:.0} ms"),
         )),
         "loss_warn" => Some((
-            "perf_loss",
+            "loss_warn",
             "warning",
             format!("packet loss {loss_pct:.0}% over last {} probes", rows.len()),
         )),
@@ -311,6 +311,11 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
             db::open_segment(&tx, n.id, &n.eff, now)?;
         }
         let in_maint = n.maint_until.is_some_and(|until| until > now);
+        let flap_transitions = if n.eff_prev != n.eff {
+            n_flaps(&tx, n.id, now - flap_window_mins * 60)?
+        } else {
+            n.flap
+        };
 
         let mut perf_status = "ok".to_string();
         let mut perf_ev: Option<(&'static str, &'static str, String)> = None;
@@ -318,7 +323,7 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
         match n.eff.as_str() {
             "up" => {
                 let cleared = db::clear_open_events_of_kind(
-                    &tx, n.id, &["device_down", "site_outage", "perf_latency", "perf_loss"], now,
+                    &tx, n.id, &["device_down", "latency_warn", "latency_crit", "loss_warn"], now,
                 )?;
                 if cleared > 0 {
                     let ev = db::create_event(&tx, Some(n.id), Some(&n.ip), "device_up",
@@ -331,7 +336,12 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
             }
             "down" => {
                 let impacted_n = impacted.get(&n.id).copied().unwrap_or(0);
-                let details = json!({ "impacted": impacted_n, "maintenance": in_maint }).to_string();
+                let flap_damped = flap_transitions >= flap_threshold;
+                let details = json!({
+                    "impacted": impacted_n,
+                    "maintenance": in_maint,
+                    "flap_damped": flap_damped,
+                }).to_string();
                 match db::open_event_for(&tx, n.id, "device_down")? {
                     None => {
                         let sev = if in_maint { "info" } else { "critical" };
@@ -342,7 +352,7 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
                         };
                         let ev = db::create_event(&tx, Some(n.id), Some(&n.ip), "device_down",
                             sev, &msg, Some(&details), now)?;
-                        if !in_maint {
+                        if !in_maint && !flap_damped {
                             crate::monitor::record_down_alert_line(
                                 out_dir, &n.role, &n.ip, None,
                             );
@@ -369,20 +379,14 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
         let mut flap_val = n.flap;
 
         if n.eff_prev != n.eff {
-            let count = n_flaps(&tx, n.id, now - flap_window_mins * 60)?;
-            flap_val = count;
-            let open_flap = db::open_event_for(&tx, n.id, "flapping")?.is_some();
-            if count >= flap_threshold && !open_flap && !in_maint {
-                let ev = db::create_event(&tx, Some(n.id), Some(&n.ip), "flapping",
-                    "warning",
-                    &format!("state changed {count} times in {flap_window_mins} min"),
-                    None, now)?;
-                fresh_alerts.push(EventOut { id: ev.id, ip: n.ip.clone(), sev: "warning".into() });
-            }
+            flap_val = flap_transitions;
+            // Flap damping is an availability state-management concern, not a
+            // standalone event kind.  Keep the count/quiet-period behavior,
+            // but do not emit the former non-taxonomy `flapping` event.
         }
         // clear once stable for `flap_threshold` consecutive healthy sweeps
-        if stable >= flap_threshold {
-            db::clear_open_events_of_kind(&tx, n.id, &["flapping"], now)?;
+        if flap_val >= flap_threshold {
+            stable = stable.min(flap_threshold);
         }
 
         // ---- perf event lifecycle
@@ -418,15 +422,14 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
             let (site, role) = db::device_by_ip(&tx, &a.ip).ok().flatten()
                 .map(|d| (db::site_name(&tx, d.site_id), d.role))
                 .unwrap_or_else(|| ("-".into(), "-".into()));
-            let payload = json!({
-                "type": "nms.event",
-                "ts": chrono::Utc::now().to_rfc3339(),
-                "event": {
-                    "id": ev.id, "kind": ev.kind, "severity": ev.severity,
-                    "message": ev.message, "details": ev.details, "created_ts": ev.created_ts,
-                },
-                "device": { "ip": a.ip, "role": role, "site": site },
-            }).to_string();
+            let payload = webhook_v1_payload(
+                &ev,
+                &a.ip,
+                &role,
+                &site,
+                &chrono::Utc::now().to_rfc3339(),
+                &[],
+            );
             db::queue_outbound(&tx, a.id, &payload, now)?;
             stats.queued += 1;
         }
@@ -450,10 +453,123 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
     Ok(stats)
 }
 
+/// Serialize the frozen FR-FLT-009 webhook-v1 shape.  Event details are
+/// stored as JSON text in SQLite, but are always decoded to an object at the
+/// wire boundary; device tags are required even when the inventory has none.
+fn webhook_v1_payload(
+    ev: &db::EventRec,
+    ip: &str,
+    role: &str,
+    site: &str,
+    ts: &str,
+    tags: &[String],
+) -> String {
+    let details = ev
+        .details
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "type": "nms.event",
+        "ts": ts,
+        "event": {
+            "id": ev.id,
+            "kind": ev.kind,
+            "severity": ev.severity,
+            "message": ev.message,
+            "details": details,
+            "created_ts": ev.created_ts,
+        },
+        "device": { "ip": ip, "role": role, "site": site, "tags": tags },
+    })
+    .to_string()
+}
+
 struct EventOut {
     id: i64,
     ip: String,
     sev: String,
+}
+
+#[cfg(test)]
+mod webhook_tests {
+    use super::*;
+
+    #[test]
+    fn webhook_v1_has_exact_object_and_array_shapes() {
+        let ev = db::EventRec {
+            id: 42,
+            created_ts: 1_000,
+            updated_ts: None,
+            device_id: Some(7),
+            ip: Some("10.20.30.1".into()),
+            kind: "device_down".into(),
+            severity: "critical".into(),
+            state: "open".into(),
+            message: "router down".into(),
+            details: Some(r#"{"impacted":40,"maintenance":false}"#.into()),
+            acknowledged: false,
+            ack_by: None,
+            ack_ts: None,
+            cleared_ts: None,
+        };
+        let tags = vec!["branch".to_string()];
+        let wire = webhook_v1_payload(&ev, "10.20.30.1", "router", "hq-1", "2026-08-24T12:00:00Z", &tags);
+        let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "nms.event",
+                "ts": "2026-08-24T12:00:00Z",
+                "event": {
+                    "id": 42,
+                    "kind": "device_down",
+                    "severity": "critical",
+                    "message": "router down",
+                    "details": {"impacted": 40, "maintenance": false},
+                    "created_ts": 1000,
+                },
+                "device": {
+                    "ip": "10.20.30.1",
+                    "role": "router",
+                    "site": "hq-1",
+                    "tags": ["branch"],
+                },
+            })
+        );
+        assert!(value["event"]["details"].is_object());
+        assert!(value["device"]["tags"].is_array());
+    }
+
+    #[test]
+    fn webhook_v1_normalizes_missing_or_invalid_details_to_object() {
+        let mut ev = db::EventRec {
+            id: 1,
+            created_ts: 1,
+            updated_ts: None,
+            device_id: None,
+            ip: None,
+            kind: "latency_warn".into(),
+            severity: "warning".into(),
+            state: "open".into(),
+            message: "slow".into(),
+            details: None,
+            acknowledged: false,
+            ack_by: None,
+            ack_ts: None,
+            cleared_ts: None,
+        };
+        for details in [None, Some("not-json".to_string()), Some("[]".to_string())] {
+            ev.details = details;
+            let value: serde_json::Value = serde_json::from_str(&webhook_v1_payload(
+                &ev, "10.0.0.1", "endpoint", "-", "2026-08-24T12:00:00Z", &[],
+            ))
+            .unwrap();
+            assert_eq!(value["event"]["details"], json!({}));
+            assert!(value["device"]["tags"].is_array());
+        }
+    }
 }
 
 /// One full monitoring cycle: sweep, persist, analyze, alert.

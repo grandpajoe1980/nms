@@ -128,9 +128,11 @@ Each cycle (`check` or a monitor sweep):
    own incident; unreachable counts roll up to the root's event details
 4. **segments** — effective-state changes open/close uptime segments
    (`state_segments` power uptime % and MTTR)
-5. **events** — lifecycle-managed: `device_down` (critical), `perf_latency`
-   (warning/critical), `perf_loss` (warning), `flapping` (warning);
-   informational `device_up`; auto-clear on recovery; ack tracked separately
+5. **events** — lifecycle-managed using the canonical PRD taxonomy:
+   `device_down` (critical), `latency_warn`/`latency_crit`, `loss_warn`, and
+   informational `device_up`; auto-clear on recovery; ack tracked separately.
+   Flap damping remains persisted as transition counters and never creates a
+   noncanonical event kind.
 6. **maintenance** — devices inside a maintenance window still get probed but
    raise no alerting events
 7. **delivery** — critical/warning events are queued as JSON payloads and
@@ -161,10 +163,10 @@ IntegrationHub endpoint that accepts the raw JSON below.
   "event": {
     "id": 42, "kind": "device_down", "severity": "critical",
     "message": "router 10.20.30.1 down — 118 dependent device(s) unreachable",
-    "details": "{\"impacted\":118,\"maintenance\":false}",
+    "details": {"impacted":118,"maintenance":false},
     "created_ts": 1771885211
   },
-  "device": { "ip": "10.20.30.1", "role": "router", "site": "10.20/16" }
+  "device": { "ip": "10.20.30.1", "role": "router", "site": "10.20/16", "tags": [] }
 }
 ```
 
