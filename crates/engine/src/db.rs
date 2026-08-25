@@ -24,6 +24,9 @@ pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("site_auto_prefix", "24"),
     ("sla_target_pct", "99.5"),
     ("snow_transform", "0"),
+    ("snow_instance_url", ""),
+    ("snow_username", ""),
+    ("snow_password", ""),
 ];
 
 pub struct Db {

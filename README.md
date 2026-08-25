@@ -138,10 +138,21 @@ Each cycle (`check` or a monitor sweep):
 
 ## ServiceNow integration (ready now)
 
-1. Open **Settings**, set `webhook_url` to your endpoint
-   (e.g. a ServiceNow *Business Rule* or *IntegrationHub* REST step that
-   accepts JSON), set `webhook_enabled=1`, save, press **send test payload**.
-2. Payload shape delivered per alert:
+**Direct mode (Basic auth, no middleware):** open **Settings** and fill in
+`snow_instance_url` (e.g. `https://yourinstance.service-now.com`),
+`snow_username` + `snow_password` (a service account with
+`incident` write access), set `snow_transform=1` and `webhook_enabled=1`,
+then save. Critical/warning alerts POST straight to
+`<instance>/api/now/table/incident` as incidents (severity→impact/urgency,
+`correlation_id = nms-<event id>`); recovery events deliver as auto-resolved
+closures. The password is write-only in the UI and never logged or returned.
+
+**Middleware mode:** alternatively point `webhook_url` at a Business Rule /
+IntegrationHub endpoint that accepts the raw JSON below.
+
+1. Either way, press **send test payload** (raw mode) or watch the first real
+   alert land as an incident.
+2. Raw payload shape delivered per alert:
 
 ```json
 {

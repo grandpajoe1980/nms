@@ -13,6 +13,44 @@ pub fn send_webhook(url: &str, payload: serde_json::Value) -> Result<u16, String
         .map_err(|e| e.to_string())
 }
 
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// HTTP Basic auth header value ("Basic <base64 user:pass>").
+pub fn basic_auth_header(user: &str, pass: &str) -> String {
+    format!("Basic {}", base64_encode(format!("{user}:{pass}").as_bytes()))
+}
+
+/// POST JSON with HTTP Basic auth (ServiceNow Table API style).
+pub fn send_webhook_basic(
+    url: &str,
+    payload: serde_json::Value,
+    user: &str,
+    pass: &str,
+) -> Result<u16, String> {
+    ureq::post(url)
+        .set("Authorization", &basic_auth_header(user, pass))
+        .timeout(Duration::from_secs(10))
+        .send_json(payload)
+        .map(|r| r.status())
+        .map_err(|e| e.to_string())
+}
+
 fn setting_i64(dbh: &Db, key: &str, default: i64) -> i64 {
     let conn = dbh.lock();
     db::get_setting_or(&conn, key, &default.to_string()).parse().unwrap_or(default)
@@ -71,11 +109,32 @@ pub fn start_webhook_sender(dbh: Arc<Db>) {
             if !enabled {
                 continue;
             }
-            let url = {
+            // ServiceNow mode targets the instance's Incident Table API with
+            // Basic auth; raw mode posts the v1 payload to webhook_url.
+            // NOTE: password lives in settings (SQLite) for now — CFG-001
+            // vault upgrade path will replace this; it is never logged,
+            // audited, or returned by any GET.
+            let (url, snow_user, snow_pass) = {
                 let conn = dbh.lock();
-                db::get_setting_or(&conn, "webhook_url", "")
+                if snow_on {
+                    (
+                        format!(
+                            "{}/api/now/table/incident",
+                            db::get_setting_or(&conn, "snow_instance_url", "")
+                                .trim_end_matches('/')
+                        ),
+                        db::get_setting_or(&conn, "snow_username", ""),
+                        db::get_setting_or(&conn, "snow_password", ""),
+                    )
+                } else {
+                    (db::get_setting_or(&conn, "webhook_url", ""), String::new(), String::new())
+                }
             };
-            if url.is_empty() {
+            if url.is_empty() || (snow_on && (snow_user.is_empty() || snow_pass.is_empty())) {
+                if snow_on {
+                    // misconfigured SNOW: skip quietly until configured
+                    continue;
+                }
                 continue;
             }
             let batch = {
@@ -94,7 +153,11 @@ pub fn start_webhook_sender(dbh: Arc<Db>) {
                 };
                 let value: serde_json::Value =
                     serde_json::from_str(&body).unwrap_or(serde_json::json!({"raw": body}));
-                let res = send_webhook(&url, value);
+                let res = if snow_on {
+                    send_webhook_basic(&url, value, &snow_user, &snow_pass)
+                } else {
+                    send_webhook(&url, value)
+                };
                 let conn = dbh.lock();
                 match res {
                     Ok(status) => {
@@ -232,5 +295,19 @@ mod tests {
         assert!(transform_for_delivery("{not json", true).is_err());
         // and passthrough mode tolerates it
         assert!(transform_for_delivery("{not json", false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod basic_auth_tests {
+    use super::*;
+
+    #[test]
+    fn base64_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(basic_auth_header("joe", "s3cret"), "Basic am9lOnMzY3JldA==");
     }
 }

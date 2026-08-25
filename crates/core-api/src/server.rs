@@ -610,6 +610,10 @@ fn settings_save(body: &str, shared: &Arc<Shared>) -> Vec<u8> {
         let Some((k, v)) = pair.split_once('=') else { continue };
         let key = url_decode(k);
         let val = url_decode(v);
+        // Write-only secret: blank submission keeps the stored password.
+        if key == "snow_password" && val.is_empty() {
+            continue;
+        }
         if db::DEFAULT_SETTINGS.iter().any(|(known, _)| *known == key)
             && db::set_setting(&conn, &key, &val).is_ok()
         {

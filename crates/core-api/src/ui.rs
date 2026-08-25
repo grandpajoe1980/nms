@@ -919,6 +919,9 @@ pub fn settings_page(conn: &Connection, saved: bool) -> String {
         ("daily_retention_days", "daily rollup retention (days)"),
         ("webhook_url", "outbound webhook URL (ServiceNow-ready JSON POST)"),
         ("webhook_enabled", "enable outbound webhook (1/0)"),
+        ("snow_transform", "deliver as ServiceNow incidents via Basic auth (1/0)"),
+        ("snow_instance_url", "ServiceNow instance URL (https://inst.service-now.com)"),
+        ("snow_username", "ServiceNow service account username"),
         ("site_auto_prefix", "auto-site subnet prefix (16 or 24)"),
     ];
     let mut body = String::new();
@@ -933,6 +936,15 @@ pub fn settings_page(conn: &Connection, saved: bool) -> String {
         let _ = write!(body,
             "<tr><td class=\"mono\">{key}</td><td><input name=\"{key}\" value=\"{v}\" size=\"42\"></td>\
 <td class=\"muted\">{desc}</td></tr>");
+    }
+    // ServiceNow password: write-only — never rendered back, blank keeps saved.
+    {
+        let saved = !db::get_setting_or(conn, "snow_password", "").is_empty();
+        let hint = if saved { "saved &#10003; \u{2014} leave blank to keep" } else { "not set" };
+        let _ = write!(body,
+            "<tr><td class=\"mono\">snow_password</td>\
+<td><input type=\"password\" name=\"snow_password\" value=\"\" autocomplete=\"off\" size=\"42\"></td>\
+<td class=\"muted\">ServiceNow service account password ({hint}; stored locally, never displayed)</td></tr>");
     }
     body.push_str(
         "</table><button type=\"submit\">save settings</button></form>\
