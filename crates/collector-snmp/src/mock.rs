@@ -5,15 +5,26 @@
 //! enforcing community checks.
 
 use crate::{
-    build_response_v2c, cmp_oid, parse_message, SnmpValue, TAG_PDU_GETBULK, TAG_PDU_GETNEXT,
+    build_response_v2c, build_response_v2c_with_status, cmp_oid, parse_message, SnmpValue,
+    TAG_PDU_GETBULK, TAG_PDU_GETNEXT,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Number of requests received by a mock agent, useful for packet-budget
+/// assertions around GETBULK consumers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestCounts {
+    pub get: usize,
+    pub getnext: usize,
+    pub getbulk: usize,
+}
+
 pub struct MockAgent {
     pub addr: SocketAddr,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    counts: Arc<std::sync::Mutex<RequestCounts>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -30,16 +41,33 @@ impl MockAgent {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+
+    pub fn request_counts(&self) -> RequestCounts {
+        self.counts.lock().map(|c| *c).unwrap_or_default()
+    }
 }
 
 pub fn spawn(
     community: &'static str,
     table: HashMap<String, SnmpValue>,
 ) -> std::io::Result<MockAgent> {
+    spawn_with_getbulk(community, table, true)
+}
+
+/// Spawn a mock agent with explicit GETBULK capability. Setting
+/// `supports_getbulk` to false returns an SNMP error for GETBULK, allowing
+/// callers to verify the required GETNEXT fallback path.
+pub fn spawn_with_getbulk(
+    community: &'static str,
+    table: HashMap<String, SnmpValue>,
+    supports_getbulk: bool,
+) -> std::io::Result<MockAgent> {
     let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
     let addr = sock.local_addr()?;
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sd = Arc::clone(&shutdown);
+    let counts = Arc::new(std::sync::Mutex::new(RequestCounts::default()));
+    let thread_counts = Arc::clone(&counts);
     // Set a short read timeout so the loop can observe the shutdown flag.
     sock.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
     let handle = std::thread::spawn(move || {
@@ -52,6 +80,13 @@ pub fn spawn(
                     let Ok(msg) = parse_message(&buf[..n]) else {
                         continue;
                     };
+                    if let Ok(mut c) = thread_counts.lock() {
+                        match msg.pdu_tag {
+                            TAG_PDU_GETNEXT => c.getnext += 1,
+                            TAG_PDU_GETBULK => c.getbulk += 1,
+                            _ => c.get += 1,
+                        }
+                    }
                     let mut out_vbs = Vec::new();
                     match msg.pdu_tag {
                         TAG_PDU_GETNEXT => {
@@ -66,6 +101,18 @@ pub fn spawn(
                             }
                         }
                         TAG_PDU_GETBULK => {
+                            if !supports_getbulk {
+                                if let Ok(resp) = build_response_v2c_with_status(
+                                    community,
+                                    msg.request_id,
+                                    5,
+                                    0,
+                                    &[],
+                                ) {
+                                    let _ = sock.send_to(&resp, src);
+                                }
+                                continue;
+                            }
                             // RFC 3416 §4.2.3: the first `non_repeaters`
                             // varbinds get one successor each; every repeated
                             // varbind gets up to `max_repetitions` chained
@@ -114,5 +161,5 @@ pub fn spawn(
             }
         }
     });
-    Ok(MockAgent { addr, shutdown, handle: Some(handle) })
+    Ok(MockAgent { addr, shutdown, counts, handle: Some(handle) })
 }

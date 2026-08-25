@@ -138,7 +138,7 @@ pub fn run(
     let iface_results: Vec<(usize, Vec<snmp::IfaceEntry>)> =
         chunked_map(&targets, 24, move |(_idx, ip)| {
             let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
-            snmp::walk_if_table(addr, &community_p2, timeout_ms.max(400), 64)
+            crate::snmpprobe::walk_interfaces_bulk(addr, &community_p2, timeout_ms.max(400), 64)
                 .ok()
                 .filter(|v| !v.is_empty())
         })

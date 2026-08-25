@@ -292,6 +292,19 @@ pub fn build_response_v2c(
     request_id: i32,
     varbinds: &[(String, SnmpValue)],
 ) -> Result<Vec<u8>> {
+    build_response_v2c_with_status(community, request_id, 0, 0, varbinds)
+}
+
+/// Build a RESPONSE PDU with an explicit error status. This is primarily
+/// useful to protocol simulators which need to advertise an unsupported
+/// operation (for example, a v1-only agent receiving GETBULK).
+pub(crate) fn build_response_v2c_with_status(
+    community: &str,
+    request_id: i32,
+    error_status: i16,
+    error_index: i16,
+    varbinds: &[(String, SnmpValue)],
+) -> Result<Vec<u8>> {
     let mut vb_bytes = Vec::new();
     for (oid, val) in varbinds {
         let mut vb = enc_oid(oid)?;
@@ -306,8 +319,8 @@ pub fn build_response_v2c(
         push_tlv(&mut vb_bytes, TAG_SEQUENCE, &vb);
     }
     let mut pdu = enc_int(request_id as i64);
-    pdu.extend_from_slice(&enc_int(0));
-    pdu.extend_from_slice(&enc_int(0));
+    pdu.extend_from_slice(&enc_int(error_status as i64));
+    pdu.extend_from_slice(&enc_int(error_index as i64));
     push_tlv(&mut pdu, TAG_SEQUENCE, &vb_bytes);
     let mut wrapped = Vec::new();
     push_tlv(&mut wrapped, TAG_PDU_RESPONSE, &pdu);
@@ -643,6 +656,96 @@ fn decode_mac(v: &SnmpValue) -> Option<String> {
     }
 }
 
+/// Walk one interface column with GETBULK, falling back to GETNEXT when the
+/// agent rejects GETBULK (for example an SNMPv1-only implementation). The
+/// fallback deliberately retains the established fresh-socket-per-request
+/// behavior needed on Windows.
+fn walk_column_bulk(
+    target: SocketAddr,
+    community: &str,
+    column: &str,
+    timeout_ms: u64,
+    max_rows: usize,
+) -> Result<VarBinds> {
+    if max_rows == 0 {
+        return Ok(Vec::new());
+    }
+    let repetitions = max_rows.min(i32::MAX as usize) as i32;
+    match getbulk(target, community, column, timeout_ms, 1, repetitions) {
+        Ok(rows) => Ok(rows),
+        Err(_bulk_err) => walk(target, community, column, timeout_ms, max_rows),
+    }
+}
+
+/// Interface inventory using GETBULK where available, with a per-column
+/// GETNEXT fallback for agents that reject GETBULK (FR-PRF-003,
+/// FR-DISC-003). Results are equivalent to [`walk_if_table`] and ordered by
+/// ascending ifIndex.
+pub fn walk_if_table_bulk(
+    target: SocketAddr,
+    community: &str,
+    timeout_ms: u64,
+    max_ifaces: usize,
+) -> Result<Vec<IfaceEntry>> {
+    if max_ifaces == 0 {
+        return Ok(Vec::new());
+    }
+    let names = column_map(
+        COL_IF_NAME,
+        walk_column_bulk(target, community, COL_IF_NAME, timeout_ms, max_ifaces)?,
+    );
+    let speeds = column_map(
+        COL_IF_HIGH_SPEED,
+        walk_column_bulk(target, community, COL_IF_HIGH_SPEED, timeout_ms, max_ifaces)?,
+    );
+    let admins = column_map(
+        COL_IF_ADMIN_STATUS,
+        walk_column_bulk(
+            target,
+            community,
+            COL_IF_ADMIN_STATUS,
+            timeout_ms,
+            max_ifaces,
+        )?,
+    );
+    let opers = column_map(
+        COL_IF_OPER_STATUS,
+        walk_column_bulk(
+            target,
+            community,
+            COL_IF_OPER_STATUS,
+            timeout_ms,
+            max_ifaces,
+        )?,
+    );
+    let macs = column_map(
+        COL_IF_PHYS_ADDRESS,
+        walk_column_bulk(
+            target,
+            community,
+            COL_IF_PHYS_ADDRESS,
+            timeout_ms,
+            max_ifaces,
+        )?,
+    );
+
+    let mut indexes: BTreeSet<i64> = BTreeSet::new();
+    for m in [&names, &speeds, &admins, &opers, &macs] {
+        indexes.extend(m.keys().copied());
+    }
+    Ok(indexes
+        .into_iter()
+        .map(|idx| IfaceEntry {
+            if_index: idx,
+            name: names.get(&idx).and_then(decode_name),
+            speed_bps: speeds.get(&idx).and_then(decode_speed),
+            admin_status: admins.get(&idx).and_then(decode_status),
+            oper_status: opers.get(&idx).and_then(decode_status),
+            mac: macs.get(&idx).and_then(decode_mac),
+        })
+        .collect())
+}
+
 /// Interface inventory convenience walk (FR-DISC-003): walks each
 /// ifName/ifHighSpeed/ifAdminStatus/ifOperStatus/ifPhysAddress column subtree
 /// separately and joins rows by ifIndex (single-arc instance suffix, per
@@ -885,6 +988,27 @@ mod tests {
         let m = parse_message(&bytes).unwrap();
         assert_eq!(m.pdu_tag, TAG_PDU_RESPONSE);
         assert_eq!(m.varbinds[0].1, SnmpValue::EndOfMibView);
+    }
+
+    /// Wire fixture for an unsupported-operation response used by the mock's
+    /// GETNEXT fallback path (error-status = genErr, 5).
+    #[test]
+    fn unsupported_bulk_error_wire_fixture() {
+        let bytes = build_response_v2c_with_status("public", 1, 5, 0, &[]).unwrap();
+        let expected: Vec<u8> = vec![
+            0x30, 0x18, // SEQUENCE, msg len 24
+            0x02, 0x01, 0x01, // version 2c
+            0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', // community
+            0xa2, 0x0b, // Response PDU, len 11
+            0x02, 0x01, 0x01, // request-id 1
+            0x02, 0x01, 0x05, // error-status genErr
+            0x02, 0x01, 0x00, // error-index 0
+            0x30, 0x00, // empty varbind list
+        ];
+        assert_eq!(bytes, expected);
+        let msg = parse_message(&bytes).unwrap();
+        assert_eq!(msg.error_status, 5);
+        assert!(msg.varbinds.is_empty());
     }
 
     /// Mock agent serves GETNEXT successors and reports endOfMibView past the

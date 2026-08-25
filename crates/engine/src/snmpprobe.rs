@@ -76,6 +76,19 @@ pub fn probe_identity(addr: SocketAddr, community: &str, timeout_ms: u64) -> Res
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("snmp probe failed")))
 }
 
+/// Collect interface inventory using SNMP GETBULK when supported, with the
+/// collector's GETNEXT fallback for older agents (FR-PRF-003,
+/// FR-DISC-003). The explicit engine entry point keeps all deep-inspection
+/// consumers on the capability-aware path.
+pub fn walk_interfaces_bulk(
+    addr: SocketAddr,
+    community: &str,
+    timeout_ms: u64,
+    max_ifaces: usize,
+) -> Result<Vec<snmp::IfaceEntry>> {
+    snmp::walk_if_table_bulk(addr, community, timeout_ms, max_ifaces)
+}
+
 /// Map well-known sysDescr markers to (vendor, os) hints.
 pub fn classify_os(descr: &str) -> Option<(&'static str, &'static str)> {
     let d = descr.to_lowercase();
@@ -151,5 +164,72 @@ mod tests {
         // port 9 on loopback: nothing listening on UDP -> clean error path
         let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert!(probe_identity(addr, "public", 120).is_err());
+    }
+
+    #[test]
+    fn bulk_interface_walk_is_equivalent_and_uses_fewer_packets() {
+        use snmp::mock;
+        let table = interface_fixture();
+        let bulk_agent = mock::spawn("public", table.clone()).unwrap();
+        let bulk = walk_interfaces_bulk(bulk_agent.addr, "public", 500, 64).unwrap();
+        let bulk_packets = bulk_agent.request_counts();
+
+        let next_agent = mock::spawn("public", table).unwrap();
+        let next = snmp::walk_if_table(next_agent.addr, "public", 500, 64).unwrap();
+        let next_packets = next_agent.request_counts();
+
+        assert_eq!(bulk, next);
+        assert!(bulk_packets.getbulk > 0);
+        assert_eq!(bulk_packets.getnext, 0);
+        let bulk_total = bulk_packets.get + bulk_packets.getnext + bulk_packets.getbulk;
+        let next_total = next_packets.get + next_packets.getnext + next_packets.getbulk;
+        assert!(
+            bulk_total * 2 <= next_total,
+            "bulk={bulk_total}, getnext={next_total}"
+        );
+    }
+
+    #[test]
+    fn bulk_interface_walk_falls_back_for_unsupported_agent() {
+        use snmp::mock;
+        let agent = mock::spawn_with_getbulk("public", interface_fixture(), false).unwrap();
+        let actual = walk_interfaces_bulk(agent.addr, "public", 500, 64).unwrap();
+        let packets = agent.request_counts();
+        assert_eq!(actual.len(), 2);
+        assert!(packets.getbulk > 0);
+        assert!(packets.getnext > 0);
+    }
+
+    fn interface_fixture() -> HashMap<String, snmp::SnmpValue> {
+        let mut table = HashMap::new();
+        table.insert(
+            "1.3.6.1.2.1.31.1.1.1.1.1".into(),
+            snmp::SnmpValue::Str(b"eth0".to_vec()),
+        );
+        table.insert(
+            "1.3.6.1.2.1.31.1.1.1.1.2".into(),
+            snmp::SnmpValue::Str(b"eth1".to_vec()),
+        );
+        table.insert(
+            "1.3.6.1.2.1.31.1.1.1.15.1".into(),
+            snmp::SnmpValue::Int(1000),
+        );
+        table.insert(
+            "1.3.6.1.2.1.31.1.1.1.15.2".into(),
+            snmp::SnmpValue::Int(100),
+        );
+        table.insert("1.3.6.1.2.1.2.2.1.7.1".into(), snmp::SnmpValue::Int(1));
+        table.insert("1.3.6.1.2.1.2.2.1.7.2".into(), snmp::SnmpValue::Int(1));
+        table.insert("1.3.6.1.2.1.2.2.1.8.1".into(), snmp::SnmpValue::Int(1));
+        table.insert("1.3.6.1.2.1.2.2.1.8.2".into(), snmp::SnmpValue::Int(2));
+        table.insert(
+            "1.3.6.1.2.1.2.2.1.6.1".into(),
+            snmp::SnmpValue::Str(vec![0xaa, 0xbb, 0xcc, 0, 0, 1]),
+        );
+        table.insert(
+            "1.3.6.1.2.1.2.2.1.6.2".into(),
+            snmp::SnmpValue::Str(vec![0xaa, 0xbb, 0xcc, 0, 0, 2]),
+        );
+        table
     }
 }
