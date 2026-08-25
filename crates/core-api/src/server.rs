@@ -427,12 +427,14 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
             let hours: i64 = query_param(query, "hours")
                 .and_then(|h| h.parse().ok())
                 .unwrap_or(24);
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            let pdf = p.out_dir.join("reports").join(format!("daily-{today}.pdf"));
+            let completed_day = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string();
+            let pdf = p.out_dir.join("reports").join(format!("daily-{completed_day}.pdf"));
             let pdf_date = std::fs::read(&pdf)
                 .map(|bytes| bytes.starts_with(b"%PDF"))
                 .unwrap_or(false)
-                .then_some(today.as_str());
+                .then_some(completed_day.as_str());
             html("200 OK", crate::ui::reports_page_with_pdf(&shared.store.lock(), hours.clamp(1, 24 * 45), pdf_date))
         }
         ("GET", "/api/report/availability.csv") => {

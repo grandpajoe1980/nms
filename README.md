@@ -51,7 +51,7 @@ performance, configuration management):
 | path analysis | on-demand ICMP traceroute per device with inventory-enriched hops (role/site/class) |
 | impact analysis | "depends on this device" listing straight on the device page |
 | inventory hygiene | devices unseen for `absent_retire_days` (default 30) are retired automatically; explicit remove button keeps the map clean today |
-| scheduled reporting | hourly 24h-availability snapshot + dated daily HTML and optional headless-print PDF under `output/reports/` (90-day retention; PDF renderer is explicit via `report_pdf_renderer` or `NMS_PDF_RENDERER`) |
+| scheduled reporting | hourly 24h-availability snapshot + dated daily HTML and headless-print PDF under `output/reports/` when Edge/Chrome/Chromium is detected (90-day retention; override via `report_pdf_renderer` or `NMS_PDF_RENDERER`) |
 | configuration management | opt-in `inspect --config-backup` SSH read-only snapshots for Cisco IOS-XE and Aruba AOS-CX (feature-gated), raw + normalized archives and unified diffs |
 | reporting | per-site availability % (24h/7d/30d), MTTR, avg RTT; HTML tables + CSV exports (site-level and per-device) |
 | audit | every user action (settings change, ack, site assign, maintenance toggle, webhook test) recorded with actor/time/details |

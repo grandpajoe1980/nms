@@ -215,11 +215,40 @@ impl PdfRenderer for CommandPdfRenderer {
 pub fn configured_pdf_renderer(conn: &Connection) -> Option<CommandPdfRenderer> {
     let configured = crate::db::get_setting_or(conn, "report_pdf_renderer", "");
     let path = if configured.trim().is_empty() {
-        std::env::var_os("NMS_PDF_RENDERER").map(PathBuf::from)
+        std::env::var_os("NMS_PDF_RENDERER")
+            .map(PathBuf::from)
+            .or_else(detect_pdf_renderer)
     } else {
         Some(PathBuf::from(configured))
     }?;
     if path.as_os_str().is_empty() { None } else { Some(CommandPdfRenderer::new(path)) }
+}
+
+/// Find a locally installed Chromium-compatible renderer. Explicit setting
+/// and environment configuration always take precedence over this fallback.
+fn detect_pdf_renderer() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    #[cfg(windows)]
+    {
+        if let Some(root) = std::env::var_os("ProgramFiles(x86)") {
+            candidates.push(PathBuf::from(root).join("Microsoft/Edge/Application/msedge.exe"));
+        }
+        if let Some(root) = std::env::var_os("ProgramFiles") {
+            let root = PathBuf::from(root);
+            candidates.push(root.join("Microsoft/Edge/Application/msedge.exe"));
+            candidates.push(root.join("Google/Chrome/Application/chrome.exe"));
+        }
+        if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(root).join("Google/Chrome/Application/chrome.exe"));
+        }
+    }
+    #[cfg(unix)]
+    candidates.extend([
+        PathBuf::from("/usr/bin/google-chrome"),
+        PathBuf::from("/usr/bin/chromium"),
+        PathBuf::from("/usr/bin/chromium-browser"),
+    ]);
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 #[derive(Serialize)]

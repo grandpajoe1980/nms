@@ -233,12 +233,13 @@ pub fn start_report_writer(dbh: Arc<Db>, out_dir: PathBuf) {
                     end_ts: day_start,
                 };
                 if day != last_day {
+                    let conn = dbh.lock();
+                    let daily_csv = crate::reports::availability_csv_window(&conn, daily_window);
                     let path = reports_dir.join(format!("daily-{day}.csv"));
                     if !path.exists() {
-                        let _ = std::fs::write(&path, &csv);
+                        let _ = std::fs::write(&path, &daily_csv);
                         println!("[jobs] wrote {}", path.display());
                     }
-                    let conn = dbh.lock();
                     let renderer = crate::reports::configured_pdf_renderer(&conn);
                     let result = crate::reports::write_daily_report(
                         &conn,
