@@ -23,13 +23,14 @@ Statuses: OPEN | IN-PROGRESS | DONE (<commit>) | BLOCKED (<reason>)
   artifact retention, and conditional PDF download endpoint. Cron-defined delivery
   remains a follow-up card; the existing hourly worker is not claimed as cron.
 
-### T-002 · SSH transport for config backups · agent: config-builder · DONE (pending commit hash)
+### T-002 · SSH transport for config backups · agent: config-builder · DONE (43d70dc + this vault corrective commit)
 - FRs: CFG-002/003. Scope: `crates/engine/src/cfgmod.rs` + new driver module;
   add `russh` (or `ssh2`) behind a Cargo feature; wire into discovery-enriched
   devices with `snmp`-style opt-in flag `--config-backup`.
 - AC: recorded-session fixture test pulls a fake config, stores snapshot,
   produces unified diff vs previous; no credentials in logs. Delivered as an
-  opt-in dedicated `inspect` enrichment pass; no config push.
+  opt-in dedicated `inspect` enrichment pass; no config push. Credential vault
+  follow-up (FR-CFG-001) adds encrypted references and admin-only mutations.
 
 ### T-003 · GETBULK consumers in engine · agent: snmp-collector-builder · OPEN
 - FRs: PRF-003, DISC-003. Scope: replace per-column ifTable walks with

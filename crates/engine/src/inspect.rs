@@ -29,7 +29,8 @@ pub struct InspectStats {
 #[derive(Clone, Debug)]
 pub struct ConfigBackupRequest {
     pub username: String,
-    pub key_path: PathBuf,
+    pub credential_ref: String,
+    pub vault_dir: PathBuf,
     pub known_hosts_path: PathBuf,
     pub port: u16,
     pub timeout_ms: u64,
@@ -223,7 +224,8 @@ pub fn run_with_config(
                 host: std::net::IpAddr::V4(ip),
                 port: request.port,
                 username: request.username.clone(),
-                key_path: request.key_path.clone(),
+                credential_ref: request.credential_ref.clone(),
+                vault_dir: request.vault_dir.clone(),
                 known_hosts_path: request.known_hosts_path.clone(),
                 timeout_ms: request.timeout_ms,
                 profile: request.profile,

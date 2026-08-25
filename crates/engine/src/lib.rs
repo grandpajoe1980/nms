@@ -5,6 +5,7 @@ pub mod arp;
 pub mod auth;
 pub mod cfgmod;
 pub mod config_driver;
+pub mod vault;
 pub mod check;
 pub mod db;
 pub mod diag;

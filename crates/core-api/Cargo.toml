@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 nms-engine = { path = "../engine" }
+zeroize.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 ipnet.workspace = true

@@ -64,7 +64,8 @@ pub struct SshConfigOptions {
     pub host: IpAddr,
     pub port: u16,
     pub username: String,
-    pub key_path: PathBuf,
+    pub credential_ref: String,
+    pub vault_dir: PathBuf,
     pub known_hosts_path: PathBuf,
     pub timeout_ms: u64,
     pub profile: ConfigProfile,
@@ -76,7 +77,8 @@ impl fmt::Debug for SshConfigOptions {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("username", &self.username)
-            .field("key_path", &"<key reference>")
+            .field("credential_ref", &"<credential reference>")
+            .field("vault_dir", &"<vault reference>")
             .field("known_hosts_path", &"<known-hosts reference>")
             .field("timeout_ms", &self.timeout_ms)
             .field("profile", &self.profile)
@@ -181,9 +183,6 @@ fn validate_ssh_references(options: &SshConfigOptions) -> Result<(), ConfigReadE
     if options.username.trim().is_empty() || options.port == 0 || options.timeout_ms == 0 {
         return Err(ConfigReadError::InvalidOptions);
     }
-    if !options.key_path.is_file() {
-        return Err(ConfigReadError::KeyReferenceUnavailable);
-    }
     if !options.known_hosts_path.is_file() {
         return Err(ConfigReadError::KnownHostsUnavailable);
     }
@@ -204,7 +203,7 @@ async fn read_config_async(options: &SshConfigOptions) -> Result<String, ConfigR
     use std::sync::Arc;
     use std::time::Duration;
     use russh::client::Handler;
-    use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+    use russh::keys::{decode_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
     use russh::{client, ChannelMsg, Disconnect};
 
     struct StrictHostKeyHandler {
@@ -229,7 +228,10 @@ async fn read_config_async(options: &SshConfigOptions) -> Result<String, ConfigR
         }
     }
 
-    let key = load_secret_key(&options.key_path, None)
+    let secret = crate::vault::read_secret(&options.vault_dir, &options.credential_ref)
+        .map_err(|_| ConfigReadError::KeyReferenceUnavailable)?;
+    let secret_text = std::str::from_utf8(&secret).map_err(|_| ConfigReadError::KeyReferenceUnavailable)?;
+    let key = decode_secret_key(secret_text, None)
         .map_err(|_| ConfigReadError::KeyReferenceUnavailable)?;
     let host = options.host.to_string();
     let handler = StrictHostKeyHandler {
@@ -343,7 +345,8 @@ mod tests {
             host: "192.0.2.1".parse().unwrap(),
             port: 22,
             username: "netops".into(),
-            key_path: PathBuf::from("private-secret-key"),
+            credential_ref: "private-secret-key".into(),
+            vault_dir: PathBuf::from("vault"),
             known_hosts_path: PathBuf::from("known-hosts-secret"),
             timeout_ms: 1000,
             profile: ConfigProfile::CiscoIosXe,
@@ -357,13 +360,12 @@ mod tests {
     #[test]
     fn missing_known_hosts_fails_closed_before_any_connection() {
         let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("key");
-        std::fs::write(&key, "not a key").unwrap();
         let opts = SshConfigOptions {
             host: "192.0.2.1".parse().unwrap(),
             port: 22,
             username: "netops".into(),
-            key_path: key,
+            credential_ref: "missing".into(),
+            vault_dir: dir.path().to_path_buf(),
             known_hosts_path: dir.path().join("missing-known-hosts"),
             timeout_ms: 1000,
             profile: ConfigProfile::CiscoIosXe,
@@ -375,15 +377,14 @@ mod tests {
     #[test]
     fn default_build_reports_feature_disabled_for_valid_references() {
         let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("key");
         let known_hosts = dir.path().join("known_hosts");
-        std::fs::write(&key, "not a key").unwrap();
         std::fs::write(&known_hosts, "").unwrap();
         let opts = SshConfigOptions {
             host: "192.0.2.1".parse().unwrap(),
             port: 22,
             username: "netops".into(),
-            key_path: key,
+            credential_ref: "missing".into(),
+            vault_dir: dir.path().to_path_buf(),
             known_hosts_path: known_hosts,
             timeout_ms: 1000,
             profile: ConfigProfile::CiscoIosXe,

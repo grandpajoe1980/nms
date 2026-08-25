@@ -141,8 +141,8 @@ enum Cmd {
         config_backup: bool,
         #[arg(long, requires = "config_backup", help = "SSH username (non-secret reference)")]
         ssh_username: Option<String>,
-        #[arg(long, requires = "config_backup", help = "path to SSH private key (reference only)")]
-        ssh_key: Option<PathBuf>,
+        #[arg(long, requires = "config_backup", help = "opaque vault credential reference")]
+        ssh_credential_ref: Option<String>,
         #[arg(long, requires = "config_backup", help = "path to strict SSH known_hosts file")]
         ssh_known_hosts: Option<PathBuf>,
         #[arg(long, default_value_t = 22, requires = "config_backup")]
@@ -363,7 +363,7 @@ fn main() -> Result<()> {
             max_devices,
             config_backup,
             ssh_username,
-            ssh_key,
+            ssh_credential_ref,
             ssh_known_hosts,
             ssh_port,
             ssh_timeout_ms,
@@ -373,11 +373,12 @@ fn main() -> Result<()> {
             let store = Arc::new(engine::db::Db::open(&out.join("ops.db"))?);
             let config_request = if config_backup {
                 let username = ssh_username.ok_or_else(|| anyhow::anyhow!("--ssh-username is required with --config-backup"))?;
-                let key_path = ssh_key.ok_or_else(|| anyhow::anyhow!("--ssh-key is required with --config-backup"))?;
+                let credential_ref = ssh_credential_ref.ok_or_else(|| anyhow::anyhow!("--ssh-credential-ref is required with --config-backup"))?;
                 let known_hosts_path = ssh_known_hosts.ok_or_else(|| anyhow::anyhow!("--ssh-known-hosts is required with --config-backup"))?;
                 Some(engine::inspect::ConfigBackupRequest {
                     username,
-                    key_path,
+                    credential_ref,
+                    vault_dir: out.clone(),
                     known_hosts_path,
                     port: ssh_port,
                     timeout_ms: ssh_timeout_ms,

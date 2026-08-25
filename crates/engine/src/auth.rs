@@ -68,6 +68,7 @@ pub fn requirement(method: &str, path: &str) -> Option<(u8, bool)> {
         // admin surface: topology-changing, config-changing, destructive
         ("POST", "/api/discover")
         | ("POST", "/api/inspect")
+        | ("POST", "/api/credentials")
         | ("POST", "/api/settings")
         | ("POST", "/api/webhook/test") => Role::Admin.rank(),
         // any other POST defaults to admin (deny-by-default)

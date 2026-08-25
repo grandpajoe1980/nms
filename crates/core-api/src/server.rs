@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub struct Params {
@@ -318,7 +319,9 @@ fn handle(stream: TcpStream, shared: Arc<Shared>, p: Params) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
     // Hardened-mode enforcement gate (FR-PLAT-005).
-    if shared.hardened {
+    let vault_mutation = (method == "POST" && path == "/api/credentials")
+        || (method == "DELETE" && path.starts_with("/api/credentials/"));
+    if shared.hardened || vault_mutation {
         if let Some((rank, is_api)) = engine::auth::requirement(method, path) {
             match resolve_role(&shared, authorization.as_deref(), cookie.as_deref()) {
                 None => {
@@ -454,6 +457,10 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
         }
         ("GET", "/api/report/availability.pdf") => availability_pdf_endpoint(query, p),
         ("POST", "/api/settings") => settings_save(body, shared),
+        ("POST", "/api/credentials") => credential_write(body, shared, p),
+        _ if method == "DELETE" && path.starts_with("/api/credentials/") => {
+            credential_delete(path.trim_start_matches("/api/credentials/"), shared, p)
+        }
         ("POST", "/api/device") => device_action(body, shared, p),
         ("POST", "/api/event/ack") => event_ack(body, shared),
         ("POST", "/api/webhook/test") => webhook_test(shared),
@@ -538,6 +545,45 @@ fn response(status: &str, content_type: &str, body: Vec<u8>) -> Vec<u8> {
     .into_bytes();
     out.extend_from_slice(&body);
     out
+}
+
+fn credential_write(body: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
+    let (id, secret): (String, Zeroizing<Vec<u8>>) = if body.trim_start().starts_with('{') {
+        let value: serde_json::Value = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(_) => return json("400 Bad Request", serde_json::json!({"error":"invalid credential request"})),
+        };
+        (
+            value.get("credential_ref").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            Zeroizing::new(value.get("secret").and_then(|v| v.as_str()).unwrap_or_default().as_bytes().to_vec()),
+        )
+    } else {
+        (
+            form_value(body, "credential_ref").unwrap_or_default(),
+            Zeroizing::new(form_value(body, "secret").unwrap_or_default().into_bytes()),
+        )
+    };
+    if id.is_empty() || secret.is_empty() {
+        return json("400 Bad Request", serde_json::json!({"error":"credential_ref and secret are required"}));
+    }
+    match engine::vault::write_secret(&p.out_dir, &id, &secret) {
+        Ok(()) => {
+            db::audit(&shared.store.lock(), "web:admin", "credential.create", &id, "encrypted credential stored");
+            json("201 Created", serde_json::json!({"credential_ref": id, "status":"stored"}))
+        }
+        Err(e) => json("400 Bad Request", serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+fn credential_delete(encoded_id: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
+    let id = url_decode(encoded_id);
+    match engine::vault::delete_secret(&p.out_dir, &id) {
+        Ok(()) => {
+            db::audit(&shared.store.lock(), "web:admin", "credential.delete", &id, "encrypted credential deleted");
+            json("200 OK", serde_json::json!({"credential_ref": id, "status":"deleted"}))
+        }
+        Err(e) => json("404 Not Found", serde_json::json!({"error": e.to_string()})),
+    }
 }
 
 fn availability_pdf_endpoint(query: &str, p: &Params) -> Vec<u8> {
@@ -980,6 +1026,8 @@ pub const API_ROUTES: &[(&str, &str, &str)] = &[
     ("POST", "/api/event/ack", "Acknowledge or unacknowledge an event"),
     ("POST", "/api/device", "Device actions: maintenance, site assignment, managed flag, removal"),
     ("POST", "/api/settings", "Update known settings keys"),
+    ("POST", "/api/credentials", "Write one encrypted credential and return its opaque reference"),
+    ("DELETE", "/api/credentials/{ref}", "Delete one encrypted credential reference"),
     ("POST", "/api/webhook/test", "Send a test payload to the configured webhook"),
     ("GET", "/api/routes", "IPv4 routing table of the collector host"),
     ("GET", "/api/ifaces", "Network interfaces of the collector host"),
@@ -1483,6 +1531,41 @@ mod tests {
         assert_eq!(v["components"]["database"]["status"], "ok");
         assert_eq!(v["components"]["scheduler"]["status"], "idle");
         assert_eq!(v["components"]["webhook_queue"]["pending"], 0);
+    }
+
+    #[test]
+    fn credential_api_is_write_only_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = test_params();
+        p.out_dir = dir.path().to_path_buf();
+        std::env::set_var("NMS_VAULT_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        let shared = test_shared();
+        let body = r#"{"credential_ref":"router-r1","secret":"PRIVATE KEY MATERIAL"}"#;
+        let write = String::from_utf8(route("POST", "/api/credentials", "", body, None, &shared, &p)).unwrap();
+        assert!(write.starts_with("HTTP/1.1 201 Created"));
+        assert!(write.contains("router-r1"));
+        assert!(!write.contains("PRIVATE KEY MATERIAL"));
+        let record = std::fs::read(dir.path().join("credentials/router-r1.json")).unwrap();
+        assert!(!String::from_utf8_lossy(&record).contains("PRIVATE KEY MATERIAL"));
+        let deleted = String::from_utf8(route("DELETE", "/api/credentials/router-r1", "", "", None, &shared, &p)).unwrap();
+        assert!(deleted.starts_with("HTTP/1.1 200 OK"));
+        assert!(!dir.path().join("credentials/router-r1.json").exists());
+        let conn = shared.store.lock();
+        let audit_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'credential.%'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(audit_count, 2);
+        std::env::remove_var("NMS_VAULT_KEY");
+    }
+
+    #[test]
+    fn credential_mutations_require_admin_rank() {
+        assert_eq!(engine::auth::requirement("POST", "/api/credentials"), Some((2, true)));
+        assert_eq!(engine::auth::requirement("DELETE", "/api/credentials/router-r1"), Some((2, true)));
+        assert!(!engine::auth::authorized(engine::auth::Role::Operator, true, 2));
+        assert!(engine::auth::authorized(engine::auth::Role::Admin, true, 2));
     }
 
     #[test]

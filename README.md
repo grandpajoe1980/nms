@@ -63,7 +63,7 @@ performance, configuration management):
 nms discover [--subnets a.b.c.d/x,...] [options]   crawl + classify + build model + sync inventory
 nms check    [--subnets ...]       [options]       one sweep -> ops DB (samples, events, alerts)
 nms monitor  [--interval-secs 60]  [options]       loop checks forever (ops engine + exec hook)
-nms inspect  [--config-backup --ssh-username USER --ssh-key PATH --ssh-known-hosts PATH] [options]
+nms inspect  [--config-backup --ssh-username USER --ssh-credential-ref REF --ssh-known-hosts PATH] [options]
 nms serve    [--port 8765]                         web console + map + monitoring controls
 nms map                                            regenerate output/map.html from model.json
 nms routes | ifaces | ping <ip>                    debug helpers
@@ -80,10 +80,16 @@ Outputs live in `--out` (default `output/`):
 
 Config backup is deliberately opt-in and runs only during the dedicated
 `inspect` enrichment pass. Build with `cargo build -p nms --features ssh`, then
-provide a username plus private-key and known-hosts file references (key bytes
-and host-key contents are never accepted as arguments, logged, or returned by
-the API). Host keys must already be present and match the supplied known-hosts
-file; unknown or changed keys fail closed. No configuration push is implemented.
+write a key into the encrypted vault using `POST /api/credentials` as an admin;
+the response contains only the opaque reference and status. Provide that
+reference plus a username and known-hosts path to `inspect`. The master key is
+read from `NMS_VAULT_KEY` (exactly 64 hex characters) or, when unset,
+`NMS_VAULT_KEY_FILE`; it is never stored. Host keys must already be present
+and match the supplied known-hosts file; unknown or changed keys fail closed.
+Credential writes/deletes are admin-only and audited; there is no secret GET or
+list endpoint. In open mode, bootstrap an admin bearer token with
+`nms token add vault-admin --role admin` and send it as `Authorization: Bearer
+...` for these mutations. No configuration push is implemented.
 
 ## The web console (`nms serve`)
 
