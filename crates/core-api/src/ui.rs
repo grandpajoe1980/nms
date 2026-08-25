@@ -513,18 +513,6 @@ pub fn device_detail(conn: &Connection, ip: &str) -> String {
 <input type=\"hidden\" name=\"ip\" value=\"{ip}\"><input type=\"hidden\" name=\"action\" value=\"remove\">\
 <button style=\"color:var(--down)\">remove from inventory</button></form></div>");
 
-    // Config backup + credential vault pointers (FR-CFG-001, FR-CFG-002).
-    // Snapshot store lives on disk, not in the DB: count sidecar files under
-    // the default output dir; a missing directory simply means zero backups.
-    if matches!(d.role.as_str(), "router" | "switch") {
-        let snaps = snapshot_count(std::path::Path::new("output"), ip);
-        let _ = write!(body,
-            "<p class=\"muted\" style=\"margin:6px 0 0\">Config backup: {snaps} snapshot(s) under \
-output/configs/{ip_esc}/ \u{2014} diffs render when CFG collection is enabled · \
-credentials: manage refs in the <a href=\"/settings\">credential vault</a></p>",
-            ip_esc = esc(ip));
-    }
-
     let _ = write!(body,
         "<div class=\"panel\" style=\"margin:10px 0\"><h2>Diagnostics</h2>\
 <button onclick=\"runDiag('{ip_js}')\">Run diagnostics</button> &nbsp;\
@@ -730,6 +718,25 @@ rbLoad();rbRuns();
     let _ = write!(body,
         "<div class=\"panel\" style=\"margin:10px 0\"><h2>Discovered neighbors ({})</h2>{nbody}</div>",
         nbrs.len());
+
+    // Config backups (FR-CFG-002): snapshots live on disk under
+    // output/configs/<ip>/<date>/<hash>.cfg.meta.json, not in the DB.
+    // Routers/switches get a panel; endpoints and other roles get nothing.
+    if matches!(d.role.as_str(), "router" | "switch") {
+        let snaps = snapshot_count(std::path::Path::new("output"), ip);
+        let inner = if snaps > 0 {
+            format!(
+                "{snaps} snapshot(s) available \u{b7} <a class=\"muted\" \
+href=\"/api/report/config-diff?ip={}\">config diff</a>",
+                urlencode(ip)
+            )
+        } else {
+            "No config backups collected yet".to_string()
+        };
+        let _ = write!(body,
+            "<div class=\"panel\" style=\"margin:10px 0\"><h2>Config backups</h2>\
+<span class=\"muted\">{inner}</span></div>");
+    }
 
     let chart = svg_line(&spark, 600, 120, "var(--info)", "ms");
     let timeline = svg_timeline(&segs, now - 86_400, now);
@@ -1540,15 +1547,43 @@ mod tests {
     }
 
     #[test]
-    fn router_shows_config_backup_note_endpoint_does_not() {
+    fn router_shows_config_backups_panel_endpoint_does_not() {
         let dbh = Db::open_memory().unwrap();
         let conn = dbh.lock();
         upsert(&conn, "10.9.5.1", "router");
         let html = device_detail(&conn, "10.9.5.1");
-        assert!(html.contains("Config backup: 0 snapshot(s)"));
+        assert!(html.contains("<h2>Config backups</h2>"));
+        assert!(html.contains("No config backups collected yet"));
+        assert!(html.contains("class=\"muted\""));
         upsert(&conn, "10.9.5.2", "endpoint");
         let html = device_detail(&conn, "10.9.5.2");
-        assert!(!html.contains("Config backup:"));
+        assert!(!html.contains("Config backups"));
+        // other roles stay silent too
+        upsert(&conn, "10.9.5.3", "unknown");
+        let html = device_detail(&conn, "10.9.5.3");
+        assert!(!html.contains("Config backups"));
+    }
+
+    #[test]
+    fn router_with_snapshots_shows_count_and_diff_link_after_neighbors() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        let ip = "10.9.8.1";
+        upsert(&conn, ip, "switch");
+        let day = std::path::Path::new("output").join("configs").join(ip).join("2026-08-25");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("aaaa.cfg.meta.json"), "{}").unwrap();
+        std::fs::write(day.join("bbbb.cfg.meta.json"), "{}").unwrap();
+        let html = device_detail(&conn, ip);
+        assert!(html.contains("<h2>Config backups</h2>"));
+        assert!(html.contains("2 snapshot(s) available"));
+        assert!(html.contains("/api/report/config-diff?ip=10.9.8.1"));
+        // panel sits after Discovered neighbors, before the RTT charts
+        let nbr_pos = html.find("<h2>Discovered neighbors").unwrap();
+        let cfg_pos = html.find("<h2>Config backups</h2>").unwrap();
+        let rtt_pos = html.find("<h2>RTT (last probes)</h2>").unwrap();
+        assert!(nbr_pos < cfg_pos && cfg_pos < rtt_pos);
+        let _ = std::fs::remove_dir_all(std::path::Path::new("output").join("configs").join(ip));
     }
 
     #[test]

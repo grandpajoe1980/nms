@@ -11,6 +11,7 @@ pub mod db;
 pub mod diag;
 pub mod discover;
 pub mod engine;
+pub mod graph;
 pub mod inspect;
 pub mod intents;
 pub mod jobs;

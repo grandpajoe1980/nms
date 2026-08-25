@@ -377,6 +377,36 @@ CREATE TABLE IF NOT EXISTS neighbors(
   UNIQUE(device_id, local_if_name, neighbor_mac, protocol)
 );
 CREATE INDEX IF NOT EXISTS idx_neighbors_device ON neighbors(device_id);
+CREATE TABLE IF NOT EXISTS graph_edges(
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  src_device_id   INTEGER NOT NULL REFERENCES devices(id),
+  dst_device_id   INTEGER NOT NULL REFERENCES devices(id),
+  edge_type       TEXT NOT NULL,
+  local_port      TEXT NOT NULL DEFAULT '',
+  remote_port     TEXT,
+  confidence      REAL NOT NULL DEFAULT 1.0,
+  source          TEXT NOT NULL,
+  first_seen_ts   INTEGER NOT NULL,
+  last_seen_ts    INTEGER NOT NULL,
+  UNIQUE(src_device_id, dst_device_id, edge_type, local_port)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_src ON graph_edges(src_device_id);
+CREATE INDEX IF NOT EXISTS idx_graph_dst ON graph_edges(dst_device_id);
+CREATE TABLE IF NOT EXISTS graph_edges(
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  src_device_id   INTEGER NOT NULL,
+  dst_device_id   INTEGER NOT NULL,
+  edge_type       TEXT NOT NULL,
+  local_port      TEXT,
+  remote_port     TEXT,
+  confidence      REAL NOT NULL DEFAULT 1.0,
+  source          TEXT NOT NULL,
+  first_seen_ts   INTEGER NOT NULL,
+  last_seen_ts    INTEGER NOT NULL,
+  UNIQUE(src_device_id, dst_device_id, edge_type, local_port)
+);
+CREATE INDEX IF NOT EXISTS idx_graph_src ON graph_edges(src_device_id);
+CREATE INDEX IF NOT EXISTS idx_graph_dst ON graph_edges(dst_device_id);
 "#;
 
 // ---------------------------------------------------------------- settings
@@ -1694,6 +1724,59 @@ mod iface_tests {
     }
 }
 
+// ------------------------------------------------------------ graph edges
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct GraphEdge {
+    pub id: i64,
+    pub src_device_id: i64,
+    pub dst_device_id: i64,
+    pub edge_type: String,
+    pub local_port: Option<String>,
+    pub remote_port: Option<String>,
+    pub confidence: f64,
+    pub source: String,
+    pub first_seen_ts: i64,
+    pub last_seen_ts: i64,
+}
+
+pub struct GraphEdgeUpsert<'a> {
+    pub src: i64,
+    pub dst: i64,
+    pub edge_type: &'a str,
+    pub local_port: Option<&'a str>,
+    pub remote_port: Option<&'a str>,
+    pub source: &'a str,
+    pub confidence: f64,
+}
+
+pub fn upsert_edge(conn: &Connection, e: &GraphEdgeUpsert, now: i64) -> Result<()> {
+    let lp = e.local_port.unwrap_or("");
+    conn.execute(
+        "INSERT INTO graph_edges(src_device_id,dst_device_id,edge_type,local_port,remote_port,confidence,source,first_seen_ts,last_seen_ts)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)
+         ON CONFLICT(src_device_id,dst_device_id,edge_type,local_port)
+         DO UPDATE SET last_seen_ts=?8, confidence=?6",
+        params![e.src,e.dst,e.edge_type,lp,e.remote_port,e.confidence,e.source,now],
+    )?;
+    Ok(())
+}
+
+pub fn all_edges(conn: &Connection) -> Result<Vec<GraphEdge>> {
+    let mut stmt = conn.prepare(
+        "SELECT id,src_device_id,dst_device_id,edge_type,local_port,remote_port,confidence,source,first_seen_ts,last_seen_ts FROM graph_edges ORDER BY src_device_id,dst_device_id")?;
+    let rows = stmt.query_map([], |r| Ok(GraphEdge{
+        id:r.get(0)?, src_device_id:r.get(1)?, dst_device_id:r.get(2)?, edge_type:r.get(3)?,
+        local_port:r.get(4)?, remote_port:r.get(5)?, confidence:r.get(6)?, source:r.get(7)?,
+        first_seen_ts:r.get(8)?, last_seen_ts:r.get(9)?}))?;
+    Ok(rows.flatten().collect())
+}
+
+pub fn stale_graph_edges(conn: &Connection, stale_before: i64) -> Result<usize> {
+    conn.execute(
+        "UPDATE graph_edges SET confidence=0.3 WHERE last_seen_ts<?1 AND confidence>0.3",
+        params![stale_before]).map_err(Into::into)
+}
 // --------------------------------------------------------------- neighbors
 
 #[derive(Clone, Debug, serde::Serialize)]

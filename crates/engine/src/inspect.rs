@@ -186,7 +186,6 @@ pub fn run_with_config(
             let rows: Vec<db::IfaceRow> = entries.iter().map(map_iface).collect();
             stats.interfaces += rows.len();
             db::replace_interfaces(&conn, dev_id, rows.as_slice(), now_ts)?;
-        }
     }
     for _ in 0..total {
         crate::progress::tick(1);
@@ -212,6 +211,13 @@ pub fn run_with_config(
             stats.neighbors += rows.len();
             db::replace_neighbors(&conn, dev_id, rows, now_ts)?;
         }
+        // ---- promote neighbor rows to temporal graph edges (FR-TOP-002)
+        match crate::graph::promote_neighbors(&conn, now_ts) {
+            Ok(n) if n > 0 => crate::logging::info(&format!("[inspect] promoted {n} graph edge(s)")),
+            Ok(_) => {}
+            Err(e) => crate::logging::error(&format!("[inspect] graph promotion failed: {e}")),
+        }
+    }
     }
     for _ in 0..total {
         crate::progress::tick(1);
