@@ -114,6 +114,7 @@ struct Node {
     root: Option<i64>,
     flap: i64,
     stable: i64,
+    flap_suppressed: bool,
     maint_until: Option<i64>,
 }
 
@@ -137,6 +138,7 @@ fn resolve_dependencies(devs: Vec<db::DeviceRec>) -> HashMap<i64, Node> {
                     root: None,
                     flap: d.flap_count,
                     stable: d.stable_cycles,
+                    flap_suppressed: d.flap_suppressed,
                     maint_until: d.maintenance_until_ts,
                 },
             )
@@ -323,7 +325,12 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
         match n.eff.as_str() {
             "up" => {
                 let cleared = db::clear_open_events_of_kind(
-                    &tx, n.id, &["device_down", "latency_warn", "latency_crit", "loss_warn"], now,
+                    &tx, n.id,
+                    &["device_down", "latency_warn", "latency_crit", "loss_warn",
+                      // Legacy rows from pre-FR-EVT-001 builds are closed on
+                      // recovery without rewriting append-only history.
+                      "site_outage", "perf_latency", "perf_loss", "flapping"],
+                    now,
                 )?;
                 if cleared > 0 {
                     let ev = db::create_event(&tx, Some(n.id), Some(&n.ip), "device_up",
@@ -369,6 +376,7 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
         // clear. Stability = consecutive sweeps with unchanged healthy state;
         // a windowed transition count alone never decays during silence.
         let mut stable = n.stable;
+        let mut flap_suppressed = n.flap_suppressed;
         if n.eff_prev != n.eff {
             stable = 0;
         } else if n.eff == "up" && !in_maint {
@@ -388,6 +396,11 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
         if flap_val >= flap_threshold {
             stable = stable.min(flap_threshold);
         }
+        if flap_transitions >= flap_threshold && n.eff == "down" && !in_maint {
+            flap_suppressed = true;
+        } else if stable >= flap_threshold {
+            flap_suppressed = false;
+        }
 
         // ---- perf event lifecycle
         if let Some((kind, sev, msg)) = perf_ev {
@@ -406,7 +419,7 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
         } else {
             None
         };
-        db::set_device_fields(&tx, n.id, &n.eff, &perf_status, down_since, flap_val, stable)?;
+        db::set_device_fields(&tx, n.id, &n.eff, &perf_status, down_since, flap_val, stable, flap_suppressed)?;
         if perf_status != "ok" {
             stats.degraded += 1;
         }
@@ -484,6 +497,35 @@ fn webhook_v1_payload(
         "device": { "ip": ip, "role": role, "site": site, "tags": tags },
     })
     .to_string()
+}
+
+/// Map an alarm into the separate §6.1 canonical telemetry envelope. This is
+/// intentionally distinct from the frozen FR-FLT-009 notification payload.
+pub fn event_to_canonical_envelope(
+    ev: &db::EventRec,
+    tenant_id: &str,
+    device_id: &str,
+    observed_at: &str,
+    ingested_at: &str,
+) -> serde_json::Value {
+    let details = ev
+        .details
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "schema": "network.telemetry.v1",
+        "tenant_id": tenant_id,
+        "source": {"collector_id": "nms-engine", "protocol": "alarm", "device_id": device_id},
+        "observed_at": observed_at,
+        "ingested_at": ingested_at,
+        "sequence": ev.id,
+        "kind": ev.kind,
+        "entity": {"type": "device", "id": device_id},
+        "payload": {"message": ev.message, "severity": ev.severity, "details": details},
+        "quality": {"counter_reset": false, "confidence": 1.0},
+    })
 }
 
 struct EventOut {
@@ -569,6 +611,24 @@ mod webhook_tests {
             assert_eq!(value["event"]["details"], json!({}));
             assert!(value["device"]["tags"].is_array());
         }
+    }
+
+    #[test]
+    fn canonical_envelope_is_separate_and_versioned() {
+        let ev = db::EventRec {
+            id: 9, created_ts: 10, updated_ts: None, device_id: Some(1),
+            ip: Some("10.0.0.1".into()), kind: "latency_warn".into(),
+            severity: "warning".into(), state: "open".into(), message: "slow".into(),
+            details: Some(r#"{"rtt_ms":200}"#.into()), acknowledged: false,
+            ack_by: None, ack_ts: None, cleared_ts: None,
+        };
+        let v = event_to_canonical_envelope(&ev, "t-1", "dev-1", "2026-08-24T14:03:17Z", "2026-08-24T14:03:18Z");
+        assert_eq!(v["schema"], "network.telemetry.v1");
+        assert_eq!(v["kind"], "latency_warn");
+        assert_eq!(v["entity"]["type"], "device");
+        assert!(v["payload"]["details"].is_object());
+        assert_eq!(v["sequence"], 9);
+        assert!(v.get("type").is_none(), "canonical envelope must not become webhook v1");
     }
 }
 

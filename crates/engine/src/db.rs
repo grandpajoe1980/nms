@@ -58,6 +58,7 @@ pub struct DeviceRec {
     pub stable_cycles: i64,
     pub hostname: Option<String>,
     pub device_class: Option<String>,
+    pub flap_suppressed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -175,6 +176,8 @@ impl Db {
             "ALTER TABLE devices ADD COLUMN hostname TEXT",
             "ALTER TABLE devices ADD COLUMN device_class TEXT",
             "ALTER TABLE devices ADD COLUMN stable_cycles INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE devices ADD COLUMN flap_suppressed INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE outbound ADD COLUMN next_attempt_ts INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -223,7 +226,8 @@ CREATE TABLE IF NOT EXISTS devices(
   down_since_ts        INTEGER,
   maintenance_until_ts INTEGER,
   flap_count           INTEGER NOT NULL DEFAULT 0,
-  notes                TEXT
+  notes                TEXT,
+  flap_suppressed      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_devices_site ON devices(site_id);
 CREATE INDEX IF NOT EXISTS idx_devices_parent ON devices(parent_id);
@@ -301,6 +305,7 @@ CREATE TABLE IF NOT EXISTS outbound(
   sent_ts    INTEGER,
   status     TEXT NOT NULL DEFAULT 'pending',
   tries      INTEGER NOT NULL DEFAULT 0,
+  next_attempt_ts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   event_id   INTEGER,
   payload    TEXT NOT NULL
@@ -487,12 +492,14 @@ fn row_device(r: &Row) -> rusqlite::Result<DeviceRec> {
         stable_cycles: r.get(19)?,
         hostname: r.get(20)?,
         device_class: r.get(21)?,
+        flap_suppressed: r.get::<_, i64>(22)? != 0,
     })
 }
 
 const DEVICE_COLS: &str = "id, ip, mac, name, role, site_id, site_source, parent_id, managed,
      poll_secs, first_seen_ts, last_seen_ts, ever_up, state, eff_state, perf_status,
-     down_since_ts, maintenance_until_ts, flap_count, stable_cycles, hostname, device_class";
+     down_since_ts, maintenance_until_ts, flap_count, stable_cycles, hostname, device_class,
+     flap_suppressed";
 
 pub fn device_by_ip(conn: &Connection, ip: &str) -> Result<Option<DeviceRec>> {
     let sql = format!("SELECT {DEVICE_COLS} FROM devices WHERE ip = ?1");
@@ -604,6 +611,7 @@ pub fn upsert_device(conn: &Connection, u: &DeviceUpdate) -> Result<DeviceRec> {
     Ok(rec)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn set_device_fields(
     conn: &Connection,
     id: i64,
@@ -612,11 +620,12 @@ pub fn set_device_fields(
     down_since_ts: Option<i64>,
     flap_count: i64,
     stable_cycles: i64,
+    flap_suppressed: bool,
 ) -> Result<()> {
     conn.execute(
         "UPDATE devices SET eff_state = ?2, perf_status = ?3, down_since_ts = ?4,
-             flap_count = ?5, stable_cycles = ?6 WHERE id = ?1",
-        params![id, eff_state, perf_status, down_since_ts, flap_count, stable_cycles],
+             flap_count = ?5, stable_cycles = ?6, flap_suppressed = ?7 WHERE id = ?1",
+        params![id, eff_state, perf_status, down_since_ts, flap_count, stable_cycles, flap_suppressed as i64],
     )?;
     Ok(())
 }
@@ -1020,9 +1029,10 @@ pub fn queue_outbound(conn: &Connection, event_id: i64, payload: &str, ts: i64) 
 pub fn pending_outbound(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT id, payload FROM outbound
-         WHERE status = 'pending' AND tries < 5 ORDER BY created_ts LIMIT ?1",
+         WHERE status = 'pending' AND tries < 5 AND next_attempt_ts <= ?2
+         ORDER BY created_ts LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let rows = stmt.query_map(params![limit, now()], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
@@ -1034,10 +1044,10 @@ pub fn mark_outbound(conn: &Connection, id: i64, ok: bool, err: Option<&str>) ->
         )?;
     } else {
         conn.execute(
-            "UPDATE outbound SET tries=tries+1, last_error=?2,
+            "UPDATE outbound SET tries=tries+1, next_attempt_ts=?3, last_error=?2,
                  status=CASE WHEN tries+1 >= 5 THEN 'failed' ELSE 'pending' END
              WHERE id=?1",
-            params![id, err.unwrap_or("unknown")],
+            params![id, err.unwrap_or("unknown"), now() + retry_delay_secs(conn, id)?],
         )?;
     }
     Ok(())
@@ -1500,8 +1510,27 @@ mod tests {
         let id = queue_outbound(&c, 9, "{\"x\":1}", 5).unwrap();
         assert_eq!(pending_outbound(&c, 10).unwrap().len(), 1);
         mark_outbound(&c, id, false, Some("conn refused")).unwrap();
+        assert_eq!(pending_outbound(&c, 10).unwrap().len(), 0, "backoff prevents a hot retry loop");
+        let next: i64 = c.query_row("SELECT next_attempt_ts FROM outbound WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert!(next > now(), "failed delivery gets a future retry schedule");
+        c.execute("UPDATE outbound SET next_attempt_ts=0 WHERE id=?1", [id]).unwrap();
         assert_eq!(pending_outbound(&c, 10).unwrap().len(), 1);
         mark_outbound(&c, id, true, None).unwrap();
+        assert!(pending_outbound(&c, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn outbound_retries_stop_at_five_attempts() {
+        let db = setup();
+        let c = db.lock();
+        let id = queue_outbound(&c, 9, "{}", now()).unwrap();
+        for attempt in 1..=5 {
+            c.execute("UPDATE outbound SET next_attempt_ts=0 WHERE id=?1", [id]).unwrap();
+            mark_outbound(&c, id, false, Some("offline")).unwrap();
+            let (tries, status): (i64, String) = c.query_row("SELECT tries,status FROM outbound WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            assert_eq!(tries, attempt);
+            assert_eq!(status, if attempt == 5 { "failed" } else { "pending" });
+        }
         assert!(pending_outbound(&c, 10).unwrap().is_empty());
     }
 
@@ -1708,6 +1737,11 @@ mod neighbor_tests {
     }
 }
 
+fn retry_delay_secs(conn: &Connection, id: i64) -> Result<i64> {
+    let tries: i64 = conn.query_row("SELECT tries FROM outbound WHERE id=?1", params![id], |r| r.get(0))?;
+    Ok(2_i64.saturating_pow((tries + 1).min(8) as u32))
+}
+
 #[cfg(test)]
 mod canonical_event_tests {
     use super::*;
@@ -1737,5 +1771,21 @@ mod canonical_event_tests {
         let err = create_event(&c, None, None, "flapping", "warning", "unstable", None, 1)
             .expect_err("legacy event kind must not enter the append-only log");
         assert!(err.to_string().contains("non-canonical event kind"));
+    }
+
+    #[test]
+    fn recovery_clear_closes_legacy_open_rows_without_rewriting_them() {
+        let db = Db::open_memory().unwrap();
+        let c = db.lock();
+        c.execute("INSERT INTO devices(ip, role, first_seen_ts, last_seen_ts) VALUES ('10.0.0.1','router',1,1)", []).unwrap();
+        let id: i64 = c.query_row("SELECT id FROM devices WHERE ip='10.0.0.1'", [], |r| r.get(0)).unwrap();
+        for kind in ["site_outage", "perf_latency", "perf_loss", "flapping"] {
+            c.execute("INSERT INTO events(created_ts,device_id,ip,kind,severity,state,message) VALUES (1,?1,'10.0.0.1',?2,'warning','open','legacy')", rusqlite::params![id, kind]).unwrap();
+        }
+        assert_eq!(clear_open_events_of_kind(&c, id, &["site_outage", "perf_latency", "perf_loss", "flapping"], 2).unwrap(), 4);
+        let open: i64 = c.query_row("SELECT COUNT(*) FROM events WHERE state='open'", [], |r| r.get(0)).unwrap();
+        assert_eq!(open, 0);
+        let total: i64 = c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 4, "legacy history remains append-only");
     }
 }

@@ -409,6 +409,7 @@ pub fn device_detail(conn: &Connection, ip: &str) -> String {
 <tr><td>parent</td><td>{parent}</td></tr>\
 <tr><td>first / last seen</td><td>{} / {}</td></tr>\
 <tr><td>flaps (window)</td><td>{}</td></tr>\
+<tr><td>flap suppression</td><td>{}</td></tr>\
 <tr><td>maintenance</td><td>{maint_disp}</td></tr>\
 <tr><td>uptime 24h / 7d</td><td>{} / {}</td></tr></table>",
         badge(&d.eff_state),
@@ -424,6 +425,7 @@ pub fn device_detail(conn: &Connection, ip: &str) -> String {
         hhmm(d.first_seen_ts),
         hhmm(d.last_seen_ts),
         d.flap_count,
+        if d.flap_suppressed { "suppressed" } else { "clear" },
         up24.map(|v| format!("{v:.2}%")).unwrap_or_else(|| "-".into()),
         up7d.map(|v| format!("{v:.2}%")).unwrap_or_else(|| "-".into()),
         role = esc(&d.role));
@@ -1101,6 +1103,16 @@ mod tests {
         let html = device_detail(&conn, "10.9.0.1");
         assert!(html.contains("No interface inventory collected for this endpoint"));
         assert!(!html.contains("<h2>Interfaces"));
+    }
+
+    #[test]
+    fn device_detail_shows_flap_suppression_state() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        upsert(&conn, "10.9.0.6", "endpoint");
+        conn.execute("UPDATE devices SET flap_suppressed=1 WHERE ip='10.9.0.6'", []).unwrap();
+        let html = device_detail(&conn, "10.9.0.6");
+        assert!(html.contains("<td>flap suppression</td><td>suppressed</td>"));
     }
 
     #[test]

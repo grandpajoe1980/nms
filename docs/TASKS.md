@@ -68,6 +68,7 @@ Statuses: OPEN | IN-PROGRESS | DONE (<commit>) | BLOCKED (<reason>)
 ---
 
 ## Done (recent)
+- ✅ Legacy alarm recovery, bounded webhook backoff, canonical §6.1 envelope, and persisted flap suppression (FR-EVT-001, FR-FLT-003, FR-FLT-009, NFR-11)
 - ✅ Canonical event taxonomy + frozen webhook v1 shape (FR-EVT-001, FR-FLT-009)
 - ✅ Interface inventory via ifTable walks (FR-DISC-003)
 - ✅ LLDP/CDP neighbor collection + UI (FR-DISC-004)

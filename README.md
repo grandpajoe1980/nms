@@ -136,7 +136,11 @@ Each cycle (`check` or a monitor sweep):
 6. **maintenance** — devices inside a maintenance window still get probed but
    raise no alerting events
 7. **delivery** — critical/warning events are queued as JSON payloads and
-   delivered by the webhook worker (5 retries, then parked)
+   delivered by the webhook worker with exponential retry backoff (maximum
+   five attempts, then parked in the delivery ledger).
+
+Canonical bus consumers use the separate `network.telemetry.v1` envelope from
+PRD §6.1; notification webhooks continue to use the frozen v1 shape above.
 
 ## ServiceNow integration (ready now)
 

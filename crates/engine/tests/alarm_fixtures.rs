@@ -221,6 +221,11 @@ fn flap_damping_tracks_churn_without_noncanonical_events() {
         .query_row("SELECT flap_count FROM devices WHERE ip=?1", [target], |r| r.get(0))
         .unwrap();
     assert!(flap_count >= 5, "flap damping must still track transition count");
+    let suppressed: bool = dbh
+        .lock()
+        .query_row("SELECT flap_suppressed FROM devices WHERE ip=?1", [target], |r| Ok(r.get::<_, i64>(0)? != 0))
+        .unwrap();
+    assert!(suppressed, "flap suppression must be persisted for operators");
     let alert_lines = std::fs::read_to_string(dir.path().join("alerts.log"))
         .unwrap_or_default()
         .lines()
@@ -240,4 +245,9 @@ fn flap_damping_tracks_churn_without_noncanonical_events() {
         )
         .unwrap();
     assert!(stable_cycles >= 5, "stable device must leave damping state");
+    let suppressed: bool = dbh
+        .lock()
+        .query_row("SELECT flap_suppressed FROM devices WHERE ip=?1", [target], |r| Ok(r.get::<_, i64>(0)? != 0))
+        .unwrap();
+    assert!(!suppressed, "hysteresis must clear persisted flap suppression");
 }
