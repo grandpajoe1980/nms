@@ -29,6 +29,7 @@ pub struct Params {
 enum Job {
     Idle,
     Discover,
+    Inspect,
     Check,
 }
 
@@ -37,6 +38,7 @@ impl Job {
         match self {
             Job::Idle => "idle",
             Job::Discover => "discover",
+            Job::Inspect => "inspect",
             Job::Check => "check",
         }
     }
@@ -483,6 +485,7 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
             )
         }
         ("POST", "/api/discover") => start_job(shared, p, Job::Discover),
+        ("POST", "/api/inspect") => start_job(shared, p, Job::Inspect),
         ("POST", "/api/check") => start_job(shared, p, Job::Check),
         ("POST", "/api/monitor/start") => start_monitor(shared, p),
         ("POST", "/api/monitor/stop") => {
@@ -924,6 +927,8 @@ pub const API_ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/api/report/availability.csv", "Per-site availability CSV for a time window"),
     ("GET", "/api/report/devices.csv", "Per-device availability CSV for a window/site"),
     ("POST", "/api/discover", "Queue a network discovery crawl"),
+        ("POST", "/api/inspect", "Queue a deep device inspection pass (SNMP identity, ifTable, LLDP/CDP)"),
+    ("POST", "/api/inspect", "Queue a deep device inspection pass (SNMP identity, ifTable, LLDP/CDP)"),
     ("POST", "/api/check", "Queue one status sweep cycle"),
     ("POST", "/api/monitor/start", "Start continuous monitoring loop"),
     ("POST", "/api/monitor/stop", "Stop continuous monitoring loop"),
@@ -1024,7 +1029,7 @@ fn start_job(shared: &Arc<Shared>, p: &Params, kind: Job) -> Vec<u8> {
         }
         *current = kind;
     }
-    if kind == Job::Discover && shared.monitoring.swap(false, Ordering::Relaxed) {
+    if matches!(kind, Job::Discover | Job::Inspect) && shared.monitoring.swap(false, Ordering::Relaxed) {
         set_message(shared, "monitor paused for discovery");
     }
     set_message(shared, "queued");
@@ -1038,6 +1043,16 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
     let _engine = shared.engine_lock.lock().unwrap();
     set_message(&shared, &format!("{} running", kind.as_str()));
     let result = match kind {
+        Job::Inspect => {
+            let community = db::get_setting_or(&shared.store.lock(), "snmp_community", "public");
+            engine::inspect::run(&shared.store, &p.out_dir, &community, 500, 161, 0).map(|stats| {
+                format!(
+                    "inspection complete: {} device(s) · snmp {} · interfaces {} · neighbors {} in {} ms",
+                    stats.devices, stats.snmp_ok, stats.interfaces, stats.neighbors,
+                    stats.duration_ms
+                )
+            })
+        }
         Job::Discover => discover::run(discover::Params {
             extra_subnets: p.extra_subnets.clone(),
             full: false,
@@ -1048,7 +1063,6 @@ fn run_job(shared: Arc<Shared>, p: Params, kind: Job) {
             scan: ScanParams { rate_pps: 2000.0, concurrency: 512, timeout_ms: 500, payload_len: 32 },
             out_dir: p.out_dir.clone(),
             walk_budget: 24,
-            snmp_community: "public".into(),
             deep: true,
             retire_days: 30,
         })

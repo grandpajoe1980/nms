@@ -78,8 +78,6 @@ enum Cmd {
         walks: usize,
         #[arg(long, help = "profile live endpoints: names, open ports, device class")]
         deep: bool,
-        #[arg(long, default_value = "public", help = "SNMPv2c community for identity probing (empty disables)")]
-        snmp_community: String,
         #[arg(long, default_value_t = 30, help = "retire inventory devices unseen this many days")]
         retire_days: u64,
         #[arg(long, help = "do not auto-seed from local interfaces/routes")]
@@ -129,7 +127,19 @@ enum Cmd {
         #[arg(long, default_value = "output")]
         out: PathBuf,
     },
-    #[command(about = "regenerate map.html from the stored model")]
+    #[command(about = "deep inspection pass over live devices: SNMP identity + interfaces + LLDP/CDP neighbors")]
+    Inspect {
+        #[arg(long, default_value = "public")]
+        community: String,
+        #[arg(long, default_value_t = 500)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = 161)]
+        port: u16,
+        #[arg(long, default_value_t = 0, help = "cap devices inspected (0 = all live)")]
+        max_devices: usize,
+        #[arg(long, default_value = "output")]
+        out: PathBuf,
+    },    #[command(about = "regenerate map.html from the stored model")]
     Map {
         #[arg(long, default_value = "output")]
         out: PathBuf,
@@ -234,7 +244,6 @@ fn main() -> Result<()> {
             walks,
             deep,
             retire_days,
-            snmp_community,
             no_auto,
             out,
         } => {
@@ -258,7 +267,6 @@ fn main() -> Result<()> {
                 walk_budget: walks,
                 deep,
                 retire_days,
-                snmp_community,
             })?;
             let store = engine::db::Db::open(&out.join("ops.db"))?;
             {
@@ -333,6 +341,14 @@ fn main() -> Result<()> {
                 interval_secs,
                 exec,
             })?;
+        }
+        Cmd::Inspect { community, timeout_ms, port, max_devices, out } => {
+            let store = Arc::new(engine::db::Db::open(&out.join("ops.db"))?);
+            let stats = engine::inspect::run(&store, &out, &community, timeout_ms, port, max_devices)?;
+            println!(
+                "[+] inspect: {} device(s) | snmp {} | interfaces {} | neighbors {} | {} ms",
+                stats.devices, stats.snmp_ok, stats.interfaces, stats.neighbors, stats.duration_ms
+            );
         }
         Cmd::Map { out } => {
             let path = out.join("model.json");

@@ -577,6 +577,7 @@ if (location.protocol === "file:") document.getElementById("nav").style.display 
   <a id="lnk-ifaces" href="/api/ifaces" target="_blank"><button>Ifaces</button></a>
   <button id="btn-ping" title="ping the selected device (or enter an address)">Ping</button>
   <button id="btn-discover" title="full crawl: subnets, devices, roles, map rebuild">Discover</button>
+  <button id="btn-inspect" title="thorough pass: SNMP identity + interfaces + LLDP/CDP neighbors on every live device">Inspect</button>
   <button id="btn-check" title="fast up/down sweep of everything in the model">Check now</button>
   <button id="btn-monitor" title="toggle continuous monitoring with down-alerts">Monitor</button>
   <span id="servehint" style="color:var(--dim);display:none">actions need “nms serve”</span>
@@ -932,6 +933,7 @@ window.addEventListener("resize", () => { resize(); fit(); });
 
 const SERVED = location.protocol === "http:" || location.protocol === "https:";
 const btnD = document.getElementById("btn-discover");
+const btnI = document.getElementById("btn-inspect");
 const btnC = document.getElementById("btn-check");
 const btnM = document.getElementById("btn-monitor");
 const btnStart = document.getElementById("btn-start");
@@ -947,7 +949,7 @@ async function post(p) {
   if (!r.ok) { throw new Error(await r.text() || ("HTTP " + r.status)); }
   return r.text();
 }
-function setBusy(b) { btnD.disabled = b; btnC.disabled = b; btnStart.disabled = b; }
+function setBusy(b) { btnD.disabled = b; btnC.disabled = b; btnStart.disabled = b; if (btnI) btnI.disabled = b; }
 const jobwrap = document.getElementById("jobwrap");
 const jobbar = document.getElementById("jobbar");
 async function poll() {
@@ -999,6 +1001,11 @@ if (SERVED) {
   btnD.onclick = async () => {
     setBusy(true); pill.textContent = "queued...";
     try { await post("/api/discover"); } catch (e) { alert(e.message); }
+    setTimeout(poll, 400);
+  };
+  btnI.onclick = async () => {
+    setBusy(true); pill.textContent = "queued...";
+    try { await post("/api/inspect"); } catch (e) { alert(e.message); }
     setTimeout(poll, 400);
   };
   btnC.onclick = async () => {
