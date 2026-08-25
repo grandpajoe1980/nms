@@ -200,7 +200,7 @@ fn transform_for_delivery(payload: &str, snow_on: bool) -> Result<String, String
 }
 
 /// Hourly scheduled reporting: rolling 24h availability snapshot plus a
-/// once-per-day dated CSV (StableNet-style report generation).
+/// once-per-day dated HTML/PDF report (StableNet-style report generation).
 pub fn start_report_writer(dbh: Arc<Db>, out_dir: PathBuf) {
     std::thread::Builder::new()
         .name("report-writer".into())
@@ -213,44 +213,47 @@ pub fn start_report_writer(dbh: Arc<Db>, out_dir: PathBuf) {
                     continue;
                 }
                 let conn = dbh.lock();
-                let csv = crate::reports::availability_csv(&conn, 24);
+                let now = chrono::Utc::now();
+                let csv_window = crate::reports::ReportWindow::trailing_hours(now.timestamp(), 24);
+                let csv = crate::reports::availability_csv_window(&conn, csv_window);
                 drop(conn);
                 let _ = std::fs::write(reports_dir.join("latest-24h.csv"), &csv);
-                let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                // The artifact covers the last complete UTC day, so name it
+                // for that source day rather than the generation day.
+                let day = (now.date_naive() - chrono::Duration::days(1))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                let day_start = now
+                    .date_naive()
+                    .and_hms_opt(0, 0, 0)
+                    .map(|v| v.and_utc().timestamp())
+                    .unwrap_or(now.timestamp());
+                let daily_window = crate::reports::ReportWindow {
+                    start_ts: day_start.saturating_sub(86_400),
+                    end_ts: day_start,
+                };
                 if day != last_day {
                     let path = reports_dir.join(format!("daily-{day}.csv"));
                     if !path.exists() {
                         let _ = std::fs::write(&path, &csv);
                         println!("[jobs] wrote {}", path.display());
                     }
-                    last_day = day.clone();
-                    // prune snapshots older than 90 days
-                    if let Ok(entries) = std::fs::read_dir(&reports_dir) {
-                        let cutoff = chrono::Utc::now() - chrono::Duration::days(90);
-                        for e in entries.flatten() {
-                            let name_ok = e
-                                .file_name()
-                                .to_string_lossy()
-                                .starts_with("daily-");
-                            if !name_ok {
-                                continue;
-                            }
-                            let stale = e.metadata().ok()
-                                .and_then(|m| m.modified().ok())
-                                .map(|t| t.elapsed().map(|d| d.as_secs()).unwrap_or(0))
-                                .unwrap_or(0)
-                                > 90 * 86_400;
-                            let date_stale = chrono::NaiveDate::parse_from_str(
-                                e.file_name().to_string_lossy().trim_start_matches("daily-").trim_end_matches(".csv"),
-                                "%Y-%m-%d",
-                            )
-                            .map(|d| d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc().timestamp() < cutoff.timestamp()).unwrap_or(false))
-                            .unwrap_or(false);
-                            if stale || date_stale {
-                                let _ = std::fs::remove_file(e.path());
-                            }
-                        }
+                    let conn = dbh.lock();
+                    let renderer = crate::reports::configured_pdf_renderer(&conn);
+                    let result = crate::reports::write_daily_report(
+                        &conn,
+                        &reports_dir,
+                        &day,
+                        daily_window,
+                        renderer.as_ref().map(|v| v as &dyn crate::reports::PdfRenderer),
+                    );
+                    drop(conn);
+                    match result {
+                        Ok(status) => println!("[jobs] daily report {day}: {status}"),
+                        Err(e) => eprintln!("[jobs] daily report failed: {e}"),
                     }
+                    last_day = day.clone();
+                    let _ = crate::reports::prune_daily_reports(&reports_dir, now.timestamp());
                 }
             }
         })

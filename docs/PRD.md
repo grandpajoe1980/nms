@@ -242,9 +242,9 @@ Webhook payload contract (v1, already implemented in current repo — freeze it)
 
 ### 4.11 Reporting & Business View (REP)
 
-- **FR-REP-001 (P0)** Availability % per site/device/window (24h/7d/30d/custom), MTTR/MTTA, incident counts, worst-offender tables; HTML + CSV — implemented; add PDF via headless print CSS (no heavy deps).
+- **FR-REP-001 (P0)** Availability % per site/device/window (24h/7d/30d/custom), MTTR/MTTA, incident counts, worst-offender tables; HTML + CSV — implemented; add PDF via headless print CSS (no heavy deps). Daily PDF artifacts now use deterministic source-window metadata and an explicit optional renderer.
 - **FR-REP-002 (P1)** SLA definitions: target uptime % per service/site group; monthly attainment with error-budget burn-down chart.
-- **FR-REP-003 (P1)** Scheduled delivery: cron-defined reports e-mailed/webhook-posted/stored (daily availability snapshot exists — extend).
+- **FR-REP-003 (P1)** Scheduled delivery: cron-defined reports e-mailed/webhook-posted/stored (daily availability snapshot exists — extend). Partial in M2: daily HTML/PDF is stored by the existing hourly worker; cron-defined scheduling and e-mail/webhook delivery remain open.
 - **FR-REP-004 (P2)** Capacity report: top-N interfaces trending toward saturation with forecast dates.
 - **FR-REP-005 (P2)** Executive digest: weekly summary email (incidents, changes, SLA, capacity flags).
 
@@ -514,7 +514,7 @@ Migration note: current repo modules map — `db.rs→stores/sqlite`, `ops.rs/ch
 |---|---|---|---|
 | **M0 (done)** | Seed | ICMP discover/check/monitor/map/console, SQLite ops store, events/audit/outbound webhooks, profiling, diagnostics, trace, removal/retirement (current repo ≈ v0.2) | — |
 | **M1** | Hardening | Split crates per §11 ✅ *(v0: `nms-engine` / `nms-core-api` / `nms` CLI workspace; proto + dedicated stores/ui-ts crates remain future)*; OpenAPI spec ✅ *(v0 served at `/api/openapi.json`)*; auth modes ✅ *(open/hardened, Argon2id users, sessions, bearer tokens, RBAC v0 — FR-PLAT-005)*; spool-on-disk collectors ✅ *(v0: cycle results spooled on store failure, replayed at startup — NFR-08)*; health endpoint ✅ *(`/api/health`)*; fixture-based tests; ServiceNow integration GA | Foundation + start of Discovery alpha |
-| **M2 = MVP** | StableNet core parity | + **SNMP v2c identity probing** *(v0: sysName/sysDescr/sysUpTime → hostname/vendor/OS hints; GETBULK ifTable interface inventory with GETNEXT fallback)*; LLDP/CDP topology; config backup+diff (SSH) *(v0: opt-in dedicated `inspect` enrichment, strict known-hosts/key-reference transport, Cisco IOS-XE + Aruba AOS-CX profiles, raw/normalized snapshots)*; scheduled reports PDF; triage wizard; scale test passing AC-NFR-01/02 | Discovery/Core NMS alpha → Enterprise beta |
+| **M2 = MVP** | StableNet core parity | + **SNMP v2c identity probing** *(v0: sysName/sysDescr/sysUpTime → hostname/vendor/OS hints; GETBULK ifTable interface inventory with GETNEXT fallback)*; LLDP/CDP topology; config backup+diff (SSH) *(v0: opt-in dedicated `inspect` enrichment, strict known-hosts/key-reference transport, Cisco IOS-XE + Aruba AOS-CX profiles, raw/normalized snapshots)*; scheduled reports PDF *(partial: stored daily HTML/PDF with explicit renderer; cron delivery remains)*; triage wizard; scale test passing AC-NFR-01/02 | Discovery/Core NMS alpha → Enterprise beta |
 | **M3** | NetBrain context | Graph-backed topology (temporal/provenance model §6); L2 path computation; diagnostic bundles/runbooks (read-only); intents v1 + violation alarms; map time-travel | Diagnostics & digital twin |
 | **M4** | Flows + streaming | IPFIX/sFlow ingest (GoFlow2) & views; gNMI ingest (gNMIc); utilization golden signals; capacity forecasts; edge collectors (FR-EDGE-001) | Enterprise beta → cloud-native start |
 | **M5** | Automation + AI | Write-guarded remediation w/ approvals; no-code runbook builder; baselines/anomaly ensemble; grounded NL assistant (local-model option); multi-tenant + RBAC via OIDC/OPA | Safe automation/compliance + AIOps start |

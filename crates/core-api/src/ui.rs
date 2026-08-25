@@ -925,6 +925,7 @@ pub fn settings_page(conn: &Connection, saved: bool) -> String {
         ("snow_instance_url", "ServiceNow instance URL (https://inst.service-now.com)"),
         ("snow_username", "ServiceNow service account username"),
         ("site_auto_prefix", "auto-site subnet prefix (16 or 24)"),
+        ("report_pdf_renderer", "headless browser executable path (optional; NMS_PDF_RENDERER also supported)"),
     ];
     let mut body = String::new();
     if saved {
@@ -960,6 +961,10 @@ pub fn settings_page(conn: &Connection, saved: bool) -> String {
 
 use engine::reports::availability_rows;
 pub fn reports_page(conn: &Connection, hours: i64) -> String {
+    reports_page_with_pdf(conn, hours, None)
+}
+
+pub fn reports_page_with_pdf(conn: &Connection, hours: i64, pdf_date: Option<&str>) -> String {
     let rows = availability_rows(conn, hours);
     let since = chrono::Utc::now().timestamp() - hours * 3600;
     let mttr = db::mttr_secs_window(conn, since);
@@ -993,6 +998,9 @@ pub fn reports_page(conn: &Connection, hours: i64) -> String {
         .map(|(site, _, _, _, pct, _)| format!("{} ({pct:.2}%)", esc(site)))
         .unwrap_or_else(|| "-".into());
     let mut body = String::new();
+    let pdf_link = pdf_date
+        .map(|date| format!("<a style=\"margin-left:8px\" href=\"/api/report/availability.pdf?date={date}\">download daily PDF</a>"))
+        .unwrap_or_default();
     let _ = write!(body,
         "<div style=\"display:flex;gap:8px;margin-bottom:10px;align-items:center\">\
 <a class=\"badge b-info\" href=\"/reports?hours=24\">24h</a>\
@@ -1001,7 +1009,7 @@ pub fn reports_page(conn: &Connection, hours: i64) -> String {
 <span class=\"muted\">MTTR over window: <b>{mttr_s}</b></span>\
 <span class=\"muted\">MTTA over window: <b>{mtta_s}</b></span>\
 <span class=\"muted\">SLA target: <b>{target:.2}%</b> (set sla_target_pct in Settings)</span>\
-<a style=\"margin-left:auto\" href=\"/api/report/availability.csv?hours={hours}\">download site csv</a></div>\
+<a style=\"margin-left:auto\" href=\"/api/report/availability.csv?hours={hours}\">download site csv</a>{pdf_link}</div>\
 <table><tr><th>site</th><th>devices</th><th>probes</th><th>uptime</th><th>SLA</th><th>avg rtt</th><th>per-device csv</th></tr>");
     for (site, devs, probes, ups, pct, rtt) in &rows {
         let bar = pct_bar(*pct);
@@ -1272,5 +1280,13 @@ mod tests {
         assert!(html.contains("<td class=\"mono\">0</td>"));
         assert!(html.contains("<td class=\"mono\">0 / 0</td>"));
         assert!(html.contains("<td>-</td>")); // worst site placeholder
+    }
+
+    #[test]
+    fn reports_page_links_pdf_only_when_artifact_is_known() {
+        let dbh = Db::open_memory().unwrap();
+        let conn = dbh.lock();
+        assert!(!reports_page_with_pdf(&conn, 24, None).contains("availability.pdf"));
+        assert!(reports_page_with_pdf(&conn, 24, Some("2026-08-24")).contains("availability.pdf?date=2026-08-24"));
     }
 }

@@ -17,6 +17,12 @@ Statuses: OPEN | IN-PROGRESS | DONE (<commit>) | BLOCKED (<reason>)
 
 ## M2 — StableNet core parity (current milestone)
 
+### T-014 · Scheduled availability PDF artifact · agent: reports-sla-builder · IN-PROGRESS
+- FRs: REP-001, REP-003 (partial). Scope: deterministic print-CSS daily HTML, optional
+  no-shell headless renderer, `%PDF` validation, metadata/source window, 90-day
+  artifact retention, and conditional PDF download endpoint. Cron-defined delivery
+  remains a follow-up card; the existing hourly worker is not claimed as cron.
+
 ### T-002 · SSH transport for config backups · agent: config-builder · DONE (pending commit hash)
 - FRs: CFG-002/003. Scope: `crates/engine/src/cfgmod.rs` + new driver module;
   add `russh` (or `ssh2`) behind a Cargo feature; wire into discovery-enriched

@@ -427,7 +427,13 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
             let hours: i64 = query_param(query, "hours")
                 .and_then(|h| h.parse().ok())
                 .unwrap_or(24);
-            html("200 OK", crate::ui::reports_page(&shared.store.lock(), hours.clamp(1, 24 * 45)))
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let pdf = p.out_dir.join("reports").join(format!("daily-{today}.pdf"));
+            let pdf_date = std::fs::read(&pdf)
+                .map(|bytes| bytes.starts_with(b"%PDF"))
+                .unwrap_or(false)
+                .then_some(today.as_str());
+            html("200 OK", crate::ui::reports_page_with_pdf(&shared.store.lock(), hours.clamp(1, 24 * 45), pdf_date))
         }
         ("GET", "/api/report/availability.csv") => {
             let hours: i64 = query_param(query, "hours").and_then(|h| h.parse().ok()).unwrap_or(24);
@@ -444,6 +450,7 @@ fn route(method: &str, path: &str, query: &str, body: &str, cookie: Option<&str>
                 engine::reports::devices_csv(&shared.store.lock(), hours.clamp(1, 24 * 45), site.as_deref()),
             )
         }
+        ("GET", "/api/report/availability.pdf") => availability_pdf_endpoint(query, p),
         ("POST", "/api/settings") => settings_save(body, shared),
         ("POST", "/api/device") => device_action(body, shared, p),
         ("POST", "/api/event/ack") => event_ack(body, shared),
@@ -529,6 +536,20 @@ fn response(status: &str, content_type: &str, body: Vec<u8>) -> Vec<u8> {
     .into_bytes();
     out.extend_from_slice(&body);
     out
+}
+
+fn availability_pdf_endpoint(query: &str, p: &Params) -> Vec<u8> {
+    let date = query_param(query, "date").unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+    let Ok(parsed) = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") else {
+        return text("400 Bad Request", "date must be YYYY-MM-DD".into());
+    };
+    let safe_date = parsed.format("%Y-%m-%d").to_string();
+    let path = p.out_dir.join("reports").join(format!("daily-{safe_date}.pdf"));
+    match std::fs::read(&path) {
+        Ok(bytes) if bytes.starts_with(b"%PDF") => response("200 OK", "application/pdf", bytes),
+        Ok(_) => text("404 Not Found", "PDF report is not available".into()),
+        Err(_) => text("404 Not Found", "PDF report is not available".into()),
+    }
 }
 
 fn see_other(location: &str) -> Vec<u8> {
@@ -943,6 +964,7 @@ pub const API_ROUTES: &[(&str, &str, &str)] = &[
     ("GET", "/api/device/{ip}.json", "One inventory device record"),
     ("GET", "/api/report/availability.csv", "Per-site availability CSV for a time window"),
     ("GET", "/api/report/devices.csv", "Per-device availability CSV for a window/site"),
+    ("GET", "/api/report/availability.pdf", "Daily availability PDF when a rendered artifact exists"),
     ("POST", "/api/discover", "Queue a network discovery crawl"),
         ("POST", "/api/inspect", "Queue a deep device inspection pass (SNMP identity, ifTable, LLDP/CDP)"),
     ("POST", "/api/inspect", "Queue a deep device inspection pass (SNMP identity, ifTable, LLDP/CDP)"),
@@ -1547,5 +1569,23 @@ mod tests {
             let resp = route("POST", "/login", "", body, None, &shared, &p);
             assert!(String::from_utf8(resp).unwrap().starts_with("HTTP/1.1 200 OK"));
         }
+    }
+
+    #[test]
+    fn pdf_download_requires_valid_existing_artifact() {
+        let shared = test_shared();
+        let dir = tempfile::tempdir().unwrap();
+        let reports = dir.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(reports.join("daily-2026-08-24.pdf"), b"%PDF-1.7\nfake").unwrap();
+        let mut p = test_params();
+        p.out_dir = dir.path().to_path_buf();
+        let ok = String::from_utf8(route("GET", "/api/report/availability.pdf", "date=2026-08-24", "", None, &shared, &p)).unwrap();
+        assert!(ok.starts_with("HTTP/1.1 200 OK"));
+        assert!(ok.contains("Content-Type: application/pdf"));
+        let absent = String::from_utf8(route("GET", "/api/report/availability.pdf", "date=2026-08-23", "", None, &shared, &p)).unwrap();
+        assert!(absent.starts_with("HTTP/1.1 404 Not Found"));
+        let invalid = String::from_utf8(route("GET", "/api/report/availability.pdf", "date=not-a-date", "", None, &shared, &p)).unwrap();
+        assert!(invalid.starts_with("HTTP/1.1 400 Bad Request"));
     }
 }

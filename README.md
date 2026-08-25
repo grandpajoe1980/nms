@@ -51,7 +51,7 @@ performance, configuration management):
 | path analysis | on-demand ICMP traceroute per device with inventory-enriched hops (role/site/class) |
 | impact analysis | "depends on this device" listing straight on the device page |
 | inventory hygiene | devices unseen for `absent_retire_days` (default 30) are retired automatically; explicit remove button keeps the map clean today |
-| scheduled reporting | hourly 24h-availability snapshot + dated daily CSVs under `output/reports/` (90-day retention) |
+| scheduled reporting | hourly 24h-availability snapshot + dated daily HTML and optional headless-print PDF under `output/reports/` (90-day retention; PDF renderer is explicit via `report_pdf_renderer` or `NMS_PDF_RENDERER`) |
 | configuration management | opt-in `inspect --config-backup` SSH read-only snapshots for Cisco IOS-XE and Aruba AOS-CX (feature-gated), raw + normalized archives and unified diffs |
 | reporting | per-site availability % (24h/7d/30d), MTTR, avg RTT; HTML tables + CSV exports (site-level and per-device) |
 | audit | every user action (settings change, ack, site assign, maintenance toggle, webhook test) recorded with actor/time/details |
@@ -98,7 +98,7 @@ links to the full console:
   actions (acknowledge, maintenance window, assign site, managed/unmanaged)
 - **Events** — alert list with severity/kind/state filters and ack/unack;
   events open when a condition starts and auto-close when it clears
-- **Reports** — availability per site for 24h/7d/30d windows with MTTR and CSV
+- **Reports** — availability per site for 24h/7d/30d windows with MTTR and CSV; a daily PDF download appears when a valid renderer artifact exists
   downloads
 - **Audit** — who did what, when (actor `web`, `system`)
 - **Settings** — thresholds, flap window, retention, webhook URL/enable,
@@ -116,6 +116,7 @@ GET  /api/device/<ip>.json       one device record
 GET  /api/events.json            event feed (filters via query)
 GET  /api/report/availability.csv?hours=24|168|720
 GET  /api/report/devices.csv?hours=&site=
+GET  /api/report/availability.pdf?date=YYYY-MM-DD  (404 until that daily PDF artifact exists)
 POST /api/event/ack              form: id=<n>&ack=1|0
 POST /api/device                 form: ip=<ip>&action=maintenance|site|managed&value=...
 POST /api/settings               form: key=value pairs (known keys only)
