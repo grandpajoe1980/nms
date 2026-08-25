@@ -161,6 +161,35 @@ Each cycle (`check` or a monitor sweep):
 Canonical bus consumers use the separate `network.telemetry.v1` envelope from
 PRD §6.1; notification webhooks continue to use the frozen v1 shape above.
 
+### Deterministic sweep acceptance (FR-FLT-002, NFR-01, NFR-02)
+
+The sweep boundary has a deterministic in-process probe backend for acceptance
+tests. It exercises the same global limiter, worker concurrency, deadline, and
+progress path as real ICMP; the normal CLI and production `check` path still
+open the platform ICMP backend. Run the fast equivalent with:
+
+```powershell
+cargo test -p nms-engine --lib engine::tests::synthetic_scheduler_fast_equivalent
+```
+
+Run the explicit 50,000-target release acceptance with:
+
+```powershell
+cargo test -p nms-engine --release --lib engine::tests::ac_nfr_01_fifty_thousand_synthetic_targets -- --ignored --nocapture
+```
+
+Latest controlled Windows release run: 50,000/50,000 targets in 10.02 s;
+the live reporter held approximately 4,988–5,000 probes/s and reached 100%.
+
+The NFR-02 logical seam test drives a down probe, its deadline-bounded confirm
+probe, and the alarm/outbound enqueue boundary. Sweep plus confirm is capped at
+115 seconds (120-second NFR-02 budget minus a five-second persistence/alarm
+reserve), even when a caller requests a larger budget:
+
+```powershell
+cargo test -p nms-engine --lib nfr02_synthetic_down_confirm_and_alarm_enqueue
+```
+
 ## ServiceNow integration (ready now)
 
 **Direct mode (Basic auth, no middleware):** open **Settings** and fill in

@@ -490,6 +490,23 @@ fn route_as(method: &str, path: &str, query: &str, body: &str, cookie: Option<&s
         ("POST", "/api/webhook/test") => webhook_test(shared),
         ("POST", "/api/diagnose") => diagnose_endpoint(query, shared),
         ("POST", "/api/trace") => trace_endpoint(query, shared),
+        ("GET", "/api/runbooks.json") => {
+            let bundles = engine::runbooks::load_bundles(&p.out_dir);
+            let list: Vec<serde_json::Value> = bundles.iter().map(|b| serde_json::json!({
+                "name": b.name, "title": b.title, "steps": b.steps.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            })).collect();
+            json("200 OK", serde_json::json!(list))
+        }
+        ("POST", "/api/runbook/run") => runbook_run(query, body, shared, p),
+        ("GET", "/api/runbook/runs.json") => {
+            let ip = query_param(query, "ip").unwrap_or_default();
+            let limit: i64 = query_param(query, "limit").and_then(|v| v.parse().ok()).unwrap_or(10);
+            let conn = shared.store.lock();
+            match engine::runbooks::recent_runs(&conn, &ip, limit) {
+                Ok(runs) => json("200 OK", serde_json::json!({"runs": runs})),
+                Err(e) => json("500 Internal Server Error", serde_json::json!({"error": e.to_string()})),
+            }
+        }
         ("GET", "/api/health") => health_endpoint(shared),
         ("GET", "/api/openapi.json") => json("200 OK", openapi_spec()),
         ("GET", "/metrics") => text(
@@ -966,6 +983,29 @@ fn search_endpoint(query: &str, shared: &Arc<Shared>) -> Vec<u8> {
 
     db::audit(&conn, "web", "search.query", &q, "");
     json("200 OK", serde_json::json!({ "devices": devices, "sites": sites }))
+}
+
+fn runbook_run(query: &str, body: &str, shared: &Arc<Shared>, p: &Params) -> Vec<u8> {
+    let ip = query_param(query, "ip")
+        .or_else(|| form_value(body, "ip"))
+        .and_then(|v| v.parse::<Ipv4Addr>().ok());
+    let Some(ip) = ip else {
+        return json("400 Bad Request", serde_json::json!({"error":"ip required"}));
+    };
+    let bundle_name = query_param(query, "bundle")
+        .or_else(|| form_value(body, "bundle"))
+        .unwrap_or_else(|| "down-device-triage".into());
+    let bundles = engine::runbooks::load_bundles(&p.out_dir);
+    let Some(bundle) = bundles.iter().find(|b| b.name == bundle_name) else {
+        return json("404 Not Found", serde_json::json!({"error":"unknown bundle"}));
+    };
+    match engine::runbooks::execute(&shared.store, bundle, ip, None, 60_000) {
+        Ok(rid) => {
+            db::audit(&shared.store.lock(), "web", "runbook.run", &ip.to_string(), &bundle_name);
+            json("200 OK", serde_json::json!({"run_id": rid, "bundle": bundle_name}))
+        }
+        Err(e) => json("500 Internal Server Error", serde_json::json!({"error": e.to_string()})),
+    }
 }
 
 fn health_endpoint(shared: &Arc<Shared>) -> Vec<u8> {

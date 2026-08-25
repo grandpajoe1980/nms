@@ -959,7 +959,7 @@ async function poll() {
     const p = s.progress;
     const busy = s.job !== "idle";
     if (p && p.total > 0) {
-      const pct = Math.min(100, Math.round(100 * p.done / p.total));
+      const pct = Number.isFinite(p.percent) ? p.percent : Math.min(100, Math.round(100 * p.done / p.total));
       pill.textContent = p.label + " " + pct + "%";
       if (jobwrap) jobwrap.style.display = "inline-block";
       if (jobbar) jobbar.style.width = pct + "%";

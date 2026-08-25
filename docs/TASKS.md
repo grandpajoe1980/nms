@@ -86,5 +86,11 @@ Statuses: OPEN | IN-PROGRESS | DONE (<commit>) | BLOCKED (<reason>)
 - ✅ Config snapshot store + diff core (FR-CFG-002/003 store half)
 - ✅ Panic-proof job lifecycle + structured logging (reliability hardening)
 
+### T-015 · Deterministic sweep scale acceptance · agent: m2-scale-implementer · DONE (this commit; 50k in 10.02 s)
+- FRs: FR-FLT-002, NFR-01, NFR-02. Scope: deterministic probe seam at the
+  scheduler boundary, strict global rate timing, clamped monotonic progress,
+  and 50k release plus deadline-bounded down-confirm/alarm queue evidence.
+- Evidence commands and the controlled release result are recorded in README.md.
+
 ## Blocked
 - ❌ ServiceNow e2e verification — needs live instance + creds from user.

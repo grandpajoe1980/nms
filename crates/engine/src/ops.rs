@@ -5,8 +5,10 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct CycleStats {
@@ -450,6 +452,36 @@ pub fn process_result(dbh: &Arc<Db>, res: &check::RunResult, out_dir: &Path) -> 
 
     tx.commit()?;
 
+    // ---- auto-run runbook bundles on critical device_down alarms (FR-FLT-007)
+    let autorun = db::get_setting_or(&conn, "runbooks_autorun", "1") == "1";
+    if autorun {
+        for a in &fresh_alerts {
+            if a.sev != "critical" { continue; }
+            let bundles = crate::runbooks::load_bundles(out_dir);
+            let Some(bundle) = bundles.iter().find(|b| {
+                crate::runbooks::should_auto_run(&b.trigger, "device_down", "critical")
+            }) else { continue };
+            let dbh2 = Arc::clone(dbh);
+            let _out = out_dir.to_path_buf();
+            let bundle = bundle.clone();
+            let ip_str = a.ip.clone();
+            std::thread::Builder::new().name("runbook-auto".into()).spawn(move || {
+                // brief settle so sweep results are fully committed
+                std::thread::sleep(Duration::from_millis(1500));
+                let ip: Ipv4Addr = ip_str.parse().unwrap_or(Ipv4Addr::UNSPECIFIED);
+                if ip.is_unspecified() { return; }
+                match crate::runbooks::execute(&dbh2, &bundle, ip, None, 60_000) {
+                    Ok(rid) => {
+                        crate::logging::info(&format!("[runbook] auto-ran '{}' on {ip} -> run #{rid}", bundle.name));
+                    }
+                    Err(e) => {
+                        crate::logging::error(&format!("[runbook] auto-run failed on {ip}: {e}"));
+                    }
+                }
+            }).ok();
+        }
+    }
+
     // Retire inventory entries absent beyond the configured window so that
     // decommissioned devices disappear instead of lingering as down forever.
     let retire_days = setting_i64(&conn, "absent_retire_days", 30);
@@ -735,7 +767,10 @@ fn process_result_at(
 mod tests {
     use super::*;
     use crate::check::Probe;
+    use crate::engine::{ScanParams, SyntheticBackend};
+    use crate::model::{Device, Model, Role, State, Subnet};
     use std::net::Ipv4Addr;
+    use std::time::Instant;
 
     #[test]
     fn spool_write_count_roundtrip() {
@@ -760,5 +795,61 @@ mod tests {
         assert_eq!(rec.probes.len(), 2);
         assert_eq!(rec.probes[0].ip, Ipv4Addr::new(10, 0, 0, 1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nfr02_synthetic_down_confirm_and_alarm_enqueue() {
+        let _progress_guard = crate::progress::test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let ip = Ipv4Addr::new(10, 0, 0, 1);
+        let model = Model {
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            scan_duration_ms: 0,
+            backend: "synthetic".into(),
+            subnets: vec![Subnet {
+                cidr: "10.0.0.0/30".into(), origin: "test".into(), sampled: false,
+                hosts: 2, probed: 0, alive: 0,
+            }],
+            devices: vec![Device {
+                ip, mac: None, role: Role::Router, state: State::Up,
+                subnet: Some("10.0.0.0/30".into()), rtt_ms: Some(1.0), reply_ttl: Some(64),
+                hint: None, first_seen: chrono::Utc::now().to_rfc3339(),
+                last_seen: chrono::Utc::now().to_rfc3339(), down_since: None, ever_up: true,
+                wap: None, wap_source: None, hostname: None, device_class: None,
+            }],
+            edges: Vec::new(),
+        };
+        model.save(&dir.path().join("model.json")).unwrap();
+        let params = crate::check::Params {
+            extra_subnets: Vec::new(),
+            scan: ScanParams { rate_pps: 50_000.0, concurrency: 8, timeout_ms: 1, payload_len: 8 },
+            out_dir: dir.path().to_path_buf(), max_targets: 100, budget_secs: 120, confirm_down: 1,
+        };
+        let backend = SyntheticBackend::with_down(ip);
+        let started = Instant::now();
+        let result = crate::check::sweep_once_with_backend(&params, &backend).unwrap();
+        assert!(result.probes.iter().any(|probe| probe.ip == ip && !probe.up));
+        assert!(backend.probe_count() >= 2, "main probe + confirm probe required");
+
+        let db = Arc::new(Db::open_memory().unwrap());
+        {
+            let conn = db.lock();
+            db::set_setting(&conn, "webhook_enabled", "1").unwrap();
+        }
+        let stats = process_result(&db, &result, dir.path()).unwrap();
+        assert_eq!(stats.new_events, 1);
+        assert_eq!(stats.queued, 1);
+        let conn = db.lock();
+        let pending = db::pending_outbound(&conn, 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&pending[0].1).unwrap();
+        assert_eq!(payload["event"]["kind"], "device_down");
+        let detection_to_enqueue = started.elapsed();
+        assert!(
+            detection_to_enqueue <= std::time::Duration::from_secs(
+                crate::check::NFR02_DETECTION_TO_ALARM_SECS,
+            ),
+            "detection-to-enqueue exceeded NFR-02: {detection_to_enqueue:?}",
+        );
     }
 }

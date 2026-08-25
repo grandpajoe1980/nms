@@ -26,6 +26,7 @@ pub mod profile;
 pub mod progress;
 pub mod report;
 pub mod reports;
+pub mod runbooks;
 pub mod routes;
 pub mod snmpprobe;
 pub mod snow;

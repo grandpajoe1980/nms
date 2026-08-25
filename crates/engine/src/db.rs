@@ -25,6 +25,7 @@ pub const DEFAULT_SETTINGS: &[(&str, &str)] = &[
     ("sla_target_pct", "99.5"),
     ("report_pdf_renderer", ""),
     ("snow_transform", "0"),
+    ("runbooks_autorun", "1"),
     ("snmp_community", "public"),
     ("snow_instance_url", ""),
     ("snow_username", ""),
